@@ -1156,7 +1156,7 @@ class StockWarningBot(commands.Bot):
 async def ensure_dm_interaction(interaction: discord.Interaction) -> bool:
     if interaction.guild_id is not None:
         await interaction.response.send_message(
-            "這個機器人改為私訊模式，請在與機器人的私訊中使用指令。",
+            "請在與機器人的私訊中使用這個指令。",
             ephemeral=True,
         )
         return False
@@ -1259,19 +1259,6 @@ def build_bot(settings: Settings) -> StockWarningBot:
                     f"- 前一期區間: {release_data.get('previous_score_range')}（{release_data.get('previous_color_name')}）"
                 )
         return "\n".join(lines)
-
-    @bot.tree.command(name="status", description="查看你的監控狀態（私訊模式）")
-    async def status(interaction: discord.Interaction) -> None:
-        if not await ensure_dm_interaction(interaction):
-            return
-        user = await bot.store.ensure_user(interaction.user.id)
-        lines = [
-            "你的 StockWarning 狀態:",
-            f"- 追蹤股票數: {len(user['watchlist'])}",
-            f"- 股票輪詢秒數(全域): {settings.default_stock_interval_sec}",
-            "- 景氣排程(全域): 每月 27 日 20:00（遇週末順延至週一）",
-        ]
-        await interaction.response.send_message("\n".join(lines))
 
     @bot.tree.command(name="watchlist_show", description="查看你的追蹤股票清單")
     async def watchlist_show(interaction: discord.Interaction) -> None:
@@ -1509,7 +1496,7 @@ def build_bot(settings: Settings) -> StockWarningBot:
             "\n".join(["已完成一次手動檢查。", *results, "", snapshot])
         )
 
-    @bot.tree.command(name="sync_commands", description="手動同步 slash 指令（私訊可用）")
+    @bot.tree.command(name="sync_commands", description="手動同步 slash 指令")
     async def sync_commands(interaction: discord.Interaction) -> None:
         if interaction.guild_id is not None:
             await interaction.response.send_message(
@@ -1534,7 +1521,7 @@ def build_bot(settings: Settings) -> StockWarningBot:
         if isinstance(error, app_commands.MissingPermissions):
             message = (
                 "你目前看到的是舊版指令權限檢查。請稍等幾分鐘後重開 Discord，"
-                "再到私訊使用 `/sync_commands` 或 `/status`。"
+                "再到私訊使用 `/sync_commands`。"
             )
         else:
             message = f"指令執行失敗：{type(error).__name__}"
