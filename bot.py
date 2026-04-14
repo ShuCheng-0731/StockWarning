@@ -1484,23 +1484,6 @@ def build_bot(settings: Settings) -> StockWarningBot:
             "\n".join(["已完成一次手動檢查。", *results, "", snapshot])
         )
 
-    @bot.tree.command(name="sync_commands", description="手動同步 slash 指令")
-    async def sync_commands(interaction: discord.Interaction) -> None:
-        if interaction.guild_id is not None:
-            await interaction.response.send_message(
-                "請在與機器人的私訊中使用這個指令。", ephemeral=True
-            )
-            return
-        await interaction.response.defer(thinking=True)
-        try:
-            synced = await bot.sync_global_commands()
-            await interaction.followup.send(f"已嘗試同步全域指令，數量：{synced}")
-        except Exception as exc:
-            logging.exception("手動同步全域指令失敗")
-            await interaction.followup.send(
-                f"同步失敗：{type(exc).__name__}: {exc}"
-            )
-
     @bot.tree.error
     async def on_app_command_error(
         interaction: discord.Interaction, error: app_commands.AppCommandError
@@ -1509,7 +1492,7 @@ def build_bot(settings: Settings) -> StockWarningBot:
         if isinstance(error, app_commands.MissingPermissions):
             message = (
                 "你目前看到的是舊版指令權限檢查。請稍等幾分鐘後重開 Discord，"
-                "再到私訊使用 `/sync_commands`。"
+                "再重新嘗試指令。"
             )
         else:
             message = f"指令執行失敗：{type(error).__name__}"

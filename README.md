@@ -10,7 +10,6 @@
 - `/watchlist_update`：更新追蹤條件
 - `/watchlist_remove`：移除追蹤股票
 - `/check_now`：立即手動檢查，顯示追蹤清單、股價、景氣燈號（最新與前一期分數、顏色區間）
-- `/sync_commands`：手動同步全域指令
 
 建議低占用設定（Railway）：
 
