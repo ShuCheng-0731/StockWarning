@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import ssl
 import time
 import zipfile
 from dataclasses import dataclass
@@ -386,11 +387,26 @@ async def fetch_twse_quotes(
         ex_channels.append(f"tse_{symbol}.tw")
         ex_channels.append(f"otc_{symbol}.tw")
 
-    headers = {"User-Agent": "Mozilla/5.0 StockWarningBot/1.0", "Referer": "https://mis.twse.com.tw/"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 StockWarningBot/1.0",
+        "Referer": "https://mis.twse.com.tw/",
+    }
     params = {"ex_ch": "|".join(ex_channels), "json": "1", "delay": "0"}
-    async with session.get(TWSE_QUOTE_URL, params=params, headers=headers) as resp:
-        resp.raise_for_status()
-        payload = await resp.json(content_type=None)
+    try:
+        async with session.get(TWSE_QUOTE_URL, params=params, headers=headers) as resp:
+            resp.raise_for_status()
+            payload = await resp.json(content_type=None)
+    except (
+        aiohttp.ClientConnectorCertificateError,
+        aiohttp.ClientConnectorSSLError,
+        ssl.SSLError,
+    ):
+        logging.warning("TWSE SSL 驗證失敗，改用 ssl=False 重試。")
+        async with session.get(
+            TWSE_QUOTE_URL, params=params, headers=headers, ssl=False
+        ) as resp:
+            resp.raise_for_status()
+            payload = await resp.json(content_type=None)
 
     results = payload.get("msgArray", [])
     output: dict[str, dict[str, Any]] = {}

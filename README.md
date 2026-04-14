@@ -118,3 +118,4 @@ Bot 權限至少包含：
 - `https://mis.twse.com.tw/stock/api/getStockInfo.jsp`
 
 支援上市/上櫃自動判斷，代號輸入可省略 `.TW`，例如輸入 `2330` 即可。
+若執行環境遇到 TWSE 憑證驗證問題，程式會自動降級重試（不會讓整次檢查直接失敗）。
