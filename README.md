@@ -6,8 +6,6 @@
 可用指令：
 
 - `/status`：查看你的監控狀態
-- `/settings_show`：查看你的個人設定
-- `/settings_set_interval`：設定你的輪詢秒數
 - `/watchlist_show`：查看你的追蹤清單
 - `/watchlist_add`：新增追蹤股票
 - `/watchlist_update`：更新追蹤條件

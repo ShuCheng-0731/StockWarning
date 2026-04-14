@@ -24,7 +24,8 @@ from dotenv import load_dotenv
 
 TWSE_QUOTE_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
 DATA_GOV_DATASET_URL = "https://data.gov.tw/dataset/6099"
-NDC_ECONOMY_PAGE_URL = "https://index.ndc.gov.tw/n/zh_twr"
+NDC_ECONOMY_PAGE_URL = "https://index.ndc.gov.tw/n/zh_tw"
+NDC_ECONOMY_JSON_URL = "https://index.ndc.gov.tw/n/json/lightscore"
 NDC_DEFAULT_ZIP_URL = (
     "https://ws.ndc.gov.tw/Download.ashx?"
     "u=LzAwMS9hZG1pbmlzdHJhdG9yLzEwL3JlbGZpbGUvNTc4MS82MzkyL2VhMjM1YmQ5LWQwNTItNGE2OS1hYmZjLWQ1Yzc4NWQzZDBlMi56aXA%3D"
@@ -203,6 +204,50 @@ def normalize_signal_color_text(signal_text: str | None) -> str | None:
     if text in mapping:
         return mapping[text]
     return text
+
+
+def normalize_json_key(value: Any) -> str:
+    return re.sub(r"[\s_\-:/]+", "", str(value or "").strip().lower())
+
+
+def parse_year_month(value: Any) -> tuple[int, str, str] | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+
+    digits = re.sub(r"\D", "", text)
+
+    if len(digits) in {5, 7} and digits[:3].isdigit() and int(digits[:3]) < 1911:
+        year = int(digits[:3]) + 1911
+        month = int(digits[3:5])
+        if 1900 <= year <= 2200 and 1 <= month <= 12:
+            raw_id = f"{year:04d}{month:02d}"
+            return (year * 100 + month, f"{year:04d}-{month:02d}", raw_id)
+
+    if len(digits) >= 6:
+        year = int(digits[:4])
+        month = int(digits[4:6])
+        if 1900 <= year <= 2200 and 1 <= month <= 12:
+            raw_id = f"{year:04d}{month:02d}"
+            return (year * 100 + month, f"{year:04d}-{month:02d}", raw_id)
+
+    if len(digits) == 5:
+        year = int(digits[:3]) + 1911
+        month = int(digits[3:5])
+        if 1900 <= year <= 2200 and 1 <= month <= 12:
+            raw_id = f"{year:04d}{month:02d}"
+            return (year * 100 + month, f"{year:04d}-{month:02d}", raw_id)
+
+    match = re.search(r"(\d{2,4})\D+(\d{1,2})", text)
+    if not match:
+        return None
+    year_raw = int(match.group(1))
+    month = int(match.group(2))
+    year = year_raw if year_raw >= 1911 else year_raw + 1911
+    if 1900 <= year <= 2200 and 1 <= month <= 12:
+        raw_id = f"{year:04d}{month:02d}"
+        return (year * 100 + month, f"{year:04d}-{month:02d}", raw_id)
+    return None
 
 
 def _optional_float(value: Any) -> float | None:
@@ -662,9 +707,15 @@ class StockWarningBot(commands.Bot):
 
         release_data: dict[str, Any] | None = None
         try:
-            release_data = await self._fetch_economy_release_from_zip()
+            release_data = await self._fetch_economy_release_from_ndc_json()
         except Exception:
-            logging.exception("景氣對策信號 ZIP 來源檢查失敗。")
+            logging.exception("景氣對策信號官方頁 JSON 來源檢查失敗。")
+
+        if release_data is None:
+            try:
+                release_data = await self._fetch_economy_release_from_zip()
+            except Exception:
+                logging.exception("景氣對策信號 ZIP 備援來源檢查失敗。")
 
         if release_data is None:
             return None
@@ -672,6 +723,180 @@ class StockWarningBot(commands.Bot):
         if release_data:
             self._economy_cache = {"ts": now_ts, "data": release_data}
         return release_data
+
+    def _candidate_economy_json_urls(self) -> list[str]:
+        urls: list[str] = []
+        source_url = (self.settings.economy_page_url or "").strip()
+        if source_url:
+            if "/n/json/" in source_url.lower():
+                urls.append(source_url)
+            match = re.match(r"^(https?://[^/]+)", source_url, flags=re.IGNORECASE)
+            if match:
+                urls.append(f"{match.group(1)}/n/json/lightscore")
+        urls.append(NDC_ECONOMY_JSON_URL)
+
+        deduped: list[str] = []
+        for url in urls:
+            if url and url not in deduped:
+                deduped.append(url)
+        return deduped
+
+    def _parse_economy_record_from_dict(self, row: dict[str, Any]) -> dict[str, Any] | None:
+        score: int | None = None
+        period: tuple[int, str, str] | None = None
+        signal_text: str | None = None
+
+        for key, value in row.items():
+            if isinstance(value, (dict, list, tuple)):
+                continue
+
+            key_norm = normalize_json_key(key)
+            key_text = str(key)
+
+            if score is None:
+                if (
+                    "lightscore" in key_norm
+                    or "score" in key_norm
+                    or "綜合分數" in key_text
+                    or ("景氣" in key_text and "分數" in key_text)
+                    or ("信號" in key_text and "分數" in key_text)
+                ):
+                    parsed_score = parse_int_str(value)
+                    if parsed_score is not None:
+                        score = parsed_score
+
+            if period is None:
+                if (
+                    key_norm in {"date", "month", "ym", "yearmonth", "yyyymm", "period"}
+                    or "date" in key_norm
+                    or "month" in key_norm
+                    or "年月" in key_text
+                    or "期間" in key_text
+                    or "日期" in key_text
+                ):
+                    parsed_period = parse_year_month(value)
+                    if parsed_period is not None:
+                        period = parsed_period
+
+            if signal_text is None:
+                if (
+                    "signal" in key_norm
+                    or "light" in key_norm
+                    or "color" in key_norm
+                    or "燈號" in key_text
+                    or "信號" in key_text
+                ):
+                    signal_text = normalize_signal_color_text(_optional_str(value))
+
+        if score is None or period is None:
+            return None
+
+        color_name, score_range = economy_color_range(score)
+        return {
+            "period_key": period[0],
+            "display": period[1],
+            "raw_id": period[2],
+            "score": score,
+            "signal_text": signal_text,
+            "color_name": color_name,
+            "score_range": score_range,
+        }
+
+    def _select_latest_economy_record_from_json(
+        self, payload: Any
+    ) -> dict[str, Any] | None:
+        candidates: list[dict[str, Any]] = []
+        stack: list[Any] = [payload]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, dict):
+                parsed = self._parse_economy_record_from_dict(node)
+                if parsed:
+                    candidates.append(parsed)
+                for value in node.values():
+                    if isinstance(value, (dict, list, tuple)):
+                        stack.append(value)
+            elif isinstance(node, (list, tuple)):
+                for item in node:
+                    if isinstance(item, (dict, list, tuple)):
+                        stack.append(item)
+
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: int(item["period_key"]))
+
+    def _load_json_flexibly(self, text: str) -> Any:
+        stripped = (text or "").strip()
+        if not stripped:
+            raise ValueError("空白 JSON 回應")
+
+        if stripped.startswith(")]}',"):
+            stripped = stripped[5:].strip()
+
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            pass
+
+        for open_char, close_char in (("{", "}"), ("[", "]")):
+            start = stripped.find(open_char)
+            end = stripped.rfind(close_char)
+            if start != -1 and end > start:
+                candidate = stripped[start : end + 1]
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    continue
+        raise ValueError("無法解析 JSON 內容")
+
+    async def _fetch_economy_release_from_ndc_json(self) -> dict[str, Any] | None:
+        if not self.session:
+            return None
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 StockWarningBot/1.0",
+            "Accept": "application/json,text/plain,*/*",
+            "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Origin": "https://index.ndc.gov.tw",
+            "Referer": self.settings.economy_page_url or NDC_ECONOMY_PAGE_URL,
+        }
+
+        errors: list[str] = []
+        for source_api_url in self._candidate_economy_json_urls():
+            for method in ("POST", "GET"):
+                try:
+                    async with self.session.request(
+                        method, source_api_url, headers=headers
+                    ) as resp:
+                        if resp.status >= 400:
+                            raise RuntimeError(f"回應狀態碼 {resp.status}")
+                        body = await resp.text(errors="ignore")
+
+                    payload = self._load_json_flexibly(body)
+                    latest = self._select_latest_economy_record_from_json(payload)
+                    if not latest:
+                        raise RuntimeError("JSON 內找不到可用的景氣分數與月份")
+
+                    signal_text = latest.get("signal_text") or latest.get("color_name")
+                    return {
+                        "release_id": f"period:{latest['raw_id']}:score:{latest['score']}",
+                        "display": latest["display"],
+                        "date_raw": latest["raw_id"],
+                        "score": latest["score"],
+                        "signal_text": signal_text,
+                        "color_name": latest["color_name"],
+                        "score_range": latest["score_range"],
+                        "source_api_url": source_api_url,
+                        "source_page_url": self.settings.economy_page_url,
+                        "official_page_url": self.settings.economy_page_url,
+                    }
+                except Exception as exc:
+                    errors.append(
+                        f"{method} {source_api_url[:100]}... -> {type(exc).__name__}: {exc}"
+                    )
+
+        summary = "；".join(errors[:4]) if errors else "無可用 JSON 來源"
+        raise RuntimeError(f"景氣資料抓取失敗：{summary}")
 
     async def _fetch_economy_release_from_zip(self) -> dict[str, Any] | None:
         if not self.session:
@@ -737,26 +962,27 @@ class StockWarningBot(commands.Bot):
 
         reader = csv.DictReader(io.StringIO(csv_text))
         latest_row: dict[str, str] | None = None
+        latest_period: tuple[int, str, str] | None = None
         latest_date_value = -1
         for row in reader:
             if not isinstance(row, dict):
                 continue
-            date_raw = str(row.get("Date", "")).strip()
-            if not date_raw.isdigit():
+            period = parse_year_month(row.get("Date"))
+            if period is None:
+                period = parse_year_month(row.get("年月"))
+            if period is None:
                 continue
-            date_value = int(date_raw)
+            date_value = period[0]
             if date_value > latest_date_value:
                 latest_date_value = date_value
                 latest_row = row
+                latest_period = period
 
-        if not latest_row:
+        if not latest_row or not latest_period:
             raise RuntimeError("無法從 CSV 解析最新景氣資料")
 
-        date_raw = str(latest_row.get("Date", "")).strip()
-        if len(date_raw) == 6:
-            display = f"{date_raw[:4]}-{date_raw[4:6]}"
-        else:
-            display = date_raw
+        display = latest_period[1]
+        date_raw = latest_period[2]
 
         score = parse_int_str(latest_row.get("景氣對策信號綜合分數"))
         if score is None:
@@ -776,6 +1002,7 @@ class StockWarningBot(commands.Bot):
             "color_name": color_name,
             "score_range": score_range,
             "source_zip_url": zip_url,
+            "source_api_url": None,
             "source_page_url": DATA_GOV_DATASET_URL,
             "official_page_url": self.settings.economy_page_url,
         }
@@ -817,7 +1044,10 @@ class StockWarningBot(commands.Bot):
             lines.append(f"官方燈號文字: {release_data['signal_text']}")
         if release_data.get("official_page_url"):
             lines.append(f"官方頁面: {release_data.get('official_page_url')}")
-        lines.append(f"資料頁: {release_data.get('source_page_url')}")
+        if release_data.get("source_api_url"):
+            lines.append(f"資料 API: {release_data.get('source_api_url')}")
+        elif release_data.get("source_page_url"):
+            lines.append(f"資料頁: {release_data.get('source_page_url')}")
         if release_data.get("source_zip_url"):
             lines.append(f"原始資料 ZIP: {release_data['source_zip_url']}")
 
