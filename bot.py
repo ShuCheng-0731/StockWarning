@@ -75,15 +75,15 @@ class Settings:
         data_path = Path(os.getenv("USER_DATA_PATH", "user_data.json")).resolve()
         economy_page_url = os.getenv("ECONOMY_SOURCE_URL", NDC_ECONOMY_PAGE_URL).strip()
 
-        poll_tick = _bounded_int(os.getenv("POLL_TICK_SEC"), fallback=30, minimum=10)
+        poll_tick = _bounded_int(os.getenv("POLL_TICK_SEC"), fallback=60, minimum=10)
         manual_timeout = _bounded_int(
             os.getenv("MANUAL_CHECK_TIMEOUT_SEC"), fallback=45, minimum=10
         )
         default_stock_interval = _bounded_int(
-            os.getenv("STOCK_CHECK_INTERVAL_SEC"), fallback=300, minimum=30
+            os.getenv("STOCK_CHECK_INTERVAL_SEC"), fallback=600, minimum=30
         )
         default_economy_interval = _bounded_int(
-            os.getenv("ECONOMY_CHECK_INTERVAL_SEC"), fallback=21600, minimum=300
+            os.getenv("ECONOMY_CHECK_INTERVAL_SEC"), fallback=43200, minimum=300
         )
 
         return cls(
@@ -539,29 +539,38 @@ class StockWarningBot(commands.Bot):
             if not config.get("enabled", True):
                 continue
 
-            if now_ts - float(state.get("last_stock_check_ts", 0.0)) >= float(
+            due_stock = now_ts - float(state.get("last_stock_check_ts", 0.0)) >= float(
                 config.get("stock_interval_sec", self.settings.default_stock_interval_sec)
-            ):
+            )
+            due_economy = now_ts - float(state.get("last_economy_check_ts", 0.0)) >= float(
+                config.get("economy_interval_sec", self.settings.default_economy_interval_sec)
+            )
+
+            if due_stock:
                 try:
                     await self.check_stocks_for_user(user_id, user)
                 except Exception:
                     logging.exception("使用者 %s 股票檢查失敗", user_id)
-                await self.store.update_user(
-                    user_id, lambda p: p["state"].update({"last_stock_check_ts": now_ts})
-                )
 
-            user = await self.store.get_user(user_id)
-            config = user["config"]
-            state = user["state"]
-            if now_ts - float(state.get("last_economy_check_ts", 0.0)) >= float(
-                config.get("economy_interval_sec", self.settings.default_economy_interval_sec)
-            ):
+            if due_economy:
                 try:
                     await self.check_economy_for_user(user_id, user)
                 except Exception:
                     logging.exception("使用者 %s 景氣檢查失敗", user_id)
+
+            if due_stock or due_economy:
                 await self.store.update_user(
-                    user_id, lambda p: p["state"].update({"last_economy_check_ts": now_ts})
+                    user_id,
+                    lambda p: p["state"].update(
+                        {
+                            "last_stock_check_ts": now_ts
+                            if due_stock
+                            else p["state"].get("last_stock_check_ts", 0.0),
+                            "last_economy_check_ts": now_ts
+                            if due_economy
+                            else p["state"].get("last_economy_check_ts", 0.0),
+                        }
+                    ),
                 )
 
     async def send_alert_to_user(self, user_id: int, message: str) -> None:
