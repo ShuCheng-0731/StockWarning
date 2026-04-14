@@ -845,6 +845,17 @@ def build_bot(settings: Settings) -> StockWarningBot:
             )
         )
 
+    @bot.tree.command(
+        name="settings_set_channel",
+        description="舊版相容：DM 模式固定通知到你的私訊",
+    )
+    async def settings_set_channel_compat(interaction: discord.Interaction) -> None:
+        if not await ensure_dm_interaction(interaction):
+            return
+        await interaction.response.send_message(
+            "目前是 DM 模式，不需要設定頻道。通知會直接發到你的私訊。"
+        )
+
     @bot.tree.command(name="settings_enable", description="開啟或關閉你的通知排程")
     async def settings_enable(interaction: discord.Interaction, enabled: bool) -> None:
         if not await ensure_dm_interaction(interaction):
@@ -1074,12 +1085,35 @@ def build_bot(settings: Settings) -> StockWarningBot:
         )
         await interaction.followup.send("\n".join(["已完成一次手動檢查。", *results]))
 
+    @bot.tree.command(name="sync_commands", description="手動同步 slash 指令（私訊可用）")
+    async def sync_commands(interaction: discord.Interaction) -> None:
+        if interaction.guild_id is not None:
+            await interaction.response.send_message(
+                "請在與機器人的私訊中使用這個指令。", ephemeral=True
+            )
+            return
+        await interaction.response.defer(thinking=True)
+        try:
+            synced = await bot.sync_global_commands()
+            await interaction.followup.send(f"已嘗試同步全域指令，數量：{synced}")
+        except Exception as exc:
+            logging.exception("手動同步全域指令失敗")
+            await interaction.followup.send(
+                f"同步失敗：{type(exc).__name__}: {exc}"
+            )
+
     @bot.tree.error
     async def on_app_command_error(
         interaction: discord.Interaction, error: app_commands.AppCommandError
     ) -> None:
         logging.exception("Slash 指令失敗", exc_info=error)
-        message = f"指令執行失敗：{type(error).__name__}"
+        if isinstance(error, app_commands.MissingPermissions):
+            message = (
+                "你目前看到的是舊版指令權限檢查。請稍等幾分鐘後重開 Discord，"
+                "再到私訊使用 `/sync_commands` 或 `/status`。"
+            )
+        else:
+            message = f"指令執行失敗：{type(error).__name__}"
         try:
             if interaction.response.is_done():
                 await interaction.followup.send(message, ephemeral=interaction.guild_id is not None)
