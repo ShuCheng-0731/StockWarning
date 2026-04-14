@@ -25,8 +25,13 @@ from dotenv import load_dotenv
 TWSE_QUOTE_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
 DATA_GOV_DATASET_URL = "https://data.gov.tw/dataset/6099"
 NDC_ECONOMY_PAGE_URL = "https://index.ndc.gov.tw/n/zh_twr"
+NDC_DEFAULT_ZIP_URL = (
+    "https://ws.ndc.gov.tw/Download.ashx?"
+    "u=LzAwMS9hZG1pbmlzdHJhdG9yLzEwL3JlbGZpbGUvNTc4MS82MzkyL2VhMjM1YmQ5LWQwNTItNGE2OS1hYmZjLWQ1Yzc4NWQzZDBlMi56aXA%3D"
+    "&n=5pmv5rCj5oyH5qiZ5Y%2BK54eI6JmfLnppcA%3D%3D"
+)
 NDC_ECONOMY_ZIP_URL_PATTERN = re.compile(
-    r"https://ws\.ndc\.gov\.tw/Download\.ashx\?[^\"']*icon=\.zip[^\"']*",
+    r"https://ws\.ndc\.gov\.tw/Download\.ashx\?[^\"']+",
     flags=re.IGNORECASE,
 )
 TW_STOCK_CODE_PATTERN = re.compile(r"^\d{4,6}$")
@@ -56,6 +61,7 @@ class Settings:
     discord_token: str
     data_path: Path
     economy_page_url: str
+    economy_zip_url: str | None
     guild_id: int | None
     poll_tick_sec: int
     manual_check_timeout_sec: int
@@ -74,6 +80,7 @@ class Settings:
 
         data_path = Path(os.getenv("USER_DATA_PATH", "user_data.json")).resolve()
         economy_page_url = os.getenv("ECONOMY_SOURCE_URL", NDC_ECONOMY_PAGE_URL).strip()
+        economy_zip_url = os.getenv("ECONOMY_ZIP_URL", "").strip() or None
 
         poll_tick = _bounded_int(os.getenv("POLL_TICK_SEC"), fallback=60, minimum=10)
         manual_timeout = _bounded_int(
@@ -90,6 +97,7 @@ class Settings:
             discord_token=token,
             data_path=data_path,
             economy_page_url=economy_page_url or NDC_ECONOMY_PAGE_URL,
+            economy_zip_url=economy_zip_url,
             guild_id=guild_id,
             poll_tick_sec=poll_tick,
             manual_check_timeout_sec=manual_timeout,
@@ -236,10 +244,6 @@ def write_json(path: Path, data: Any) -> None:
 def default_user_payload(settings: Settings) -> dict[str, Any]:
     return {
         "watchlist": copy.deepcopy(DEFAULT_WATCHLIST),
-        "config": {
-            "stock_interval_sec": settings.default_stock_interval_sec,
-            "economy_interval_sec": settings.default_economy_interval_sec,
-        },
         "state": {
             "stock_alerts": {},
             "economy": {"last_release_id": None},
@@ -297,22 +301,6 @@ class UserDataStore:
         if not normalized_watchlist:
             normalized_watchlist = copy.deepcopy(DEFAULT_WATCHLIST)
         payload["watchlist"] = normalized_watchlist
-
-        config = payload.get("config")
-        if not isinstance(config, dict):
-            config = {}
-        payload["config"] = {
-            "stock_interval_sec": _bounded_int(
-                config.get("stock_interval_sec"),
-                fallback=self.settings.default_stock_interval_sec,
-                minimum=30,
-            ),
-            "economy_interval_sec": _bounded_int(
-                config.get("economy_interval_sec"),
-                fallback=self.settings.default_economy_interval_sec,
-                minimum=300,
-            ),
-        }
 
         state = payload.get("state")
         if not isinstance(state, dict):
@@ -532,14 +520,13 @@ class StockWarningBot(commands.Bot):
 
         for user_id in user_ids:
             user = await self.store.get_user(user_id)
-            config = user["config"]
             state = user["state"]
 
             due_stock = now_ts - float(state.get("last_stock_check_ts", 0.0)) >= float(
-                config.get("stock_interval_sec", self.settings.default_stock_interval_sec)
+                self.settings.default_stock_interval_sec
             )
             due_economy = now_ts - float(state.get("last_economy_check_ts", 0.0)) >= float(
-                config.get("economy_interval_sec", self.settings.default_economy_interval_sec)
+                self.settings.default_economy_interval_sec
             )
 
             if due_stock:
@@ -690,22 +677,53 @@ class StockWarningBot(commands.Bot):
         if not self.session:
             return None
 
-        headers = {"User-Agent": "Mozilla/5.0 StockWarningBot/1.0"}
-        async with self.session.get(DATA_GOV_DATASET_URL, headers=headers) as resp:
-            if resp.status >= 400:
-                raise RuntimeError(f"data.gov.tw 回應狀態碼 {resp.status}")
-            html = await resp.text(errors="ignore")
+        page_headers = {
+            "User-Agent": "Mozilla/5.0 StockWarningBot/1.0",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Referer": "https://data.gov.tw/",
+        }
+        download_headers = {
+            "User-Agent": "Mozilla/5.0 StockWarningBot/1.0",
+            "Accept": "application/zip,application/octet-stream,*/*",
+            "Referer": DATA_GOV_DATASET_URL,
+        }
 
-        url_match = NDC_ECONOMY_ZIP_URL_PATTERN.search(html)
-        if not url_match:
-            raise RuntimeError("找不到景氣指標 ZIP 下載連結")
-        zip_url = unescape(url_match.group(0))
+        candidate_urls: list[str] = []
+        if self.settings.economy_zip_url:
+            candidate_urls.append(self.settings.economy_zip_url)
 
-        async with self.session.get(zip_url, headers=headers) as resp:
-            if resp.status >= 400:
-                raise RuntimeError(f"ZIP 下載回應狀態碼 {resp.status}")
-            zip_bytes = await resp.read()
+        try:
+            async with self.session.get(DATA_GOV_DATASET_URL, headers=page_headers) as resp:
+                if resp.status >= 400:
+                    raise RuntimeError(f"data.gov.tw 回應狀態碼 {resp.status}")
+                html = await resp.text(errors="ignore")
+            for raw_url in NDC_ECONOMY_ZIP_URL_PATTERN.findall(html):
+                parsed = unescape(raw_url).replace("&amp;", "&")
+                if parsed not in candidate_urls:
+                    candidate_urls.append(parsed)
+        except Exception as exc:
+            logging.warning("解析 data.gov 下載連結失敗：%s", exc)
 
+        if NDC_DEFAULT_ZIP_URL not in candidate_urls:
+            candidate_urls.append(NDC_DEFAULT_ZIP_URL)
+
+        errors: list[str] = []
+        for zip_url in candidate_urls:
+            try:
+                async with self.session.get(zip_url, headers=download_headers) as resp:
+                    if resp.status >= 400:
+                        raise RuntimeError(f"ZIP 下載回應狀態碼 {resp.status}")
+                    zip_bytes = await resp.read()
+                return self._parse_economy_zip_bytes(zip_bytes, zip_url)
+            except Exception as exc:
+                errors.append(f"{zip_url[:120]}... -> {type(exc).__name__}: {exc}")
+                continue
+
+        summary = "；".join(errors[:3]) if errors else "無可用 ZIP 來源"
+        raise RuntimeError(f"景氣資料抓取失敗：{summary}")
+
+    def _parse_economy_zip_bytes(self, zip_bytes: bytes, zip_url: str) -> dict[str, Any]:
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as archive:
             csv_name = None
             for name in archive.namelist():
@@ -912,68 +930,13 @@ def build_bot(settings: Settings) -> StockWarningBot:
         if not await ensure_dm_interaction(interaction):
             return
         user = await bot.store.ensure_user(interaction.user.id)
-        config = user["config"]
         lines = [
             "你的 StockWarning 狀態:",
             f"- 追蹤股票數: {len(user['watchlist'])}",
-            f"- 股票輪詢秒數: {config['stock_interval_sec']}",
-            f"- 景氣輪詢秒數: {config['economy_interval_sec']}",
+            f"- 股票輪詢秒數(全域): {settings.default_stock_interval_sec}",
+            f"- 景氣輪詢秒數(全域): {settings.default_economy_interval_sec}",
         ]
         await interaction.response.send_message("\n".join(lines))
-
-    @bot.tree.command(name="settings_show", description="查看你目前的個人設定")
-    async def settings_show(interaction: discord.Interaction) -> None:
-        if not await ensure_dm_interaction(interaction):
-            return
-        user = await bot.store.ensure_user(interaction.user.id)
-        config = user["config"]
-        await interaction.response.send_message(
-            "\n".join(
-                [
-                    "你的個人設定:",
-                    f"- 股票輪詢秒數: {config['stock_interval_sec']}",
-                    f"- 景氣輪詢秒數: {config['economy_interval_sec']}",
-                ]
-            )
-        )
-
-    @bot.tree.command(name="settings_set_interval", description="設定你的輪詢秒數")
-    async def settings_set_interval(
-        interaction: discord.Interaction,
-        stock_seconds: int | None = None,
-        economy_seconds: int | None = None,
-    ) -> None:
-        if not await ensure_dm_interaction(interaction):
-            return
-        if stock_seconds is None and economy_seconds is None:
-            await interaction.response.send_message(
-                "請至少填一個參數：`stock_seconds` 或 `economy_seconds`。"
-            )
-            return
-        if stock_seconds is not None and stock_seconds < 30:
-            await interaction.response.send_message("`stock_seconds` 最小值是 30 秒。")
-            return
-        if economy_seconds is not None and economy_seconds < 300:
-            await interaction.response.send_message("`economy_seconds` 最小值是 300 秒。")
-            return
-
-        def mutator(payload: dict[str, Any]) -> None:
-            if stock_seconds is not None:
-                payload["config"]["stock_interval_sec"] = stock_seconds
-            if economy_seconds is not None:
-                payload["config"]["economy_interval_sec"] = economy_seconds
-
-        updated = await bot.store.update_user(interaction.user.id, mutator)
-        config = updated["config"]
-        await interaction.response.send_message(
-            "\n".join(
-                [
-                    "已更新你的輪詢設定。",
-                    f"- 股票輪詢秒數: {config['stock_interval_sec']}",
-                    f"- 景氣輪詢秒數: {config['economy_interval_sec']}",
-                ]
-            )
-        )
 
     @bot.tree.command(name="watchlist_show", description="查看你的追蹤股票清單")
     async def watchlist_show(interaction: discord.Interaction) -> None:
