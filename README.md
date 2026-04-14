@@ -1,15 +1,20 @@
-# StockWarning Discord Bot (Python)
+# StockWarning Discord Bot (Python, DM Mode)
 
-用 Python 建立的 Discord 機器人，支援：
+這版改為「私訊模式」：
 
-- 股票漲跌幅/目標價示警（台股、美股皆可）
+- 使用者在與 Bot 的私訊裡下指令
+- 每個 Discord 帳號有獨立設定與追蹤清單
+- 通知直接發到該使用者的私訊
+
+## 1. 功能
+
+- 股票漲跌幅/目標價示警（台股、美股可混用）
 - 景氣對策信號更新通知（預設來源：`https://index.ndc.gov.tw/n/zh_twr`）
-- 在 Discord 內直接管理追蹤股票、輪詢秒數、通知頻道
-
-## 1. 環境需求
-
-- Python 3.10+
-- Discord Bot Token
+- 每位使用者獨立保存：
+  - 追蹤股票清單
+  - 輪詢秒數
+  - 去重狀態（避免重複狂發）
+  - 啟用/停用排程
 
 ## 2. 安裝
 
@@ -30,86 +35,62 @@ pip install -r requirements.txt
 2. 必填：
    - `DISCORD_TOKEN`
 3. 可選：
-   - `DISCORD_CHANNEL_ID`（初始通知頻道，可改用 Discord 指令設定）
-   - `DISCORD_GUILD_ID`（單一伺服器快速同步 slash commands）
-   - `STOCK_CHECK_INTERVAL_SEC`
-   - `ECONOMY_CHECK_INTERVAL_SEC`
+   - `DISCORD_GUILD_ID`（指令同步加速用）
+   - `POLL_TICK_SEC`
+   - `STOCK_CHECK_INTERVAL_SEC`（新使用者預設）
+   - `ECONOMY_CHECK_INTERVAL_SEC`（新使用者預設）
    - `MANUAL_CHECK_TIMEOUT_SEC`
-   - `WATCHLIST_PATH`
-   - `STATE_PATH`
-   - `RUNTIME_CONFIG_PATH`
+   - `USER_DATA_PATH`（預設 `user_data.json`）
    - `ECONOMY_SOURCE_URL`
    - `ECONOMY_API_URL`
 
-程式執行後會建立：
+## 4. 啟動
 
-- `watchlist.json`：追蹤股票清單
-- `state.json`：示警去重狀態
-- `config.json`：通知頻道與輪詢秒數（可透過 Discord 指令修改）
+```bash
+python bot.py
+```
 
-## 4. Discord 權限
-
-在 Discord Developer Portal 建議至少給：
-
-- `View Channels`
-- `Send Messages`
+## 5. Discord 權限
 
 OAuth2 scopes：
 
 - `bot`
 - `applications.commands`
 
-## 5. 啟動
+Bot 權限至少包含：
 
-```bash
-python bot.py
-```
+- `Send Messages`
 
-## 6. Slash Commands
+## 6. 使用方式（私訊）
 
-一般成員可用：
+1. 在 Discord 開啟與機器人的私訊視窗
+2. 在私訊裡輸入 `/` 使用下列指令
 
-- `/status`：查看整體狀態（追蹤數、輪詢秒數、通知頻道）
-- `/settings_show`：查看通知頻道與輪詢設定
-- `/watchlist_show`：查看追蹤清單
-- `/check_now`：立即手動檢查一次
+可用指令：
 
-需要「管理伺服器」權限：
-
-- `/settings_set_channel`：設定通知頻道
-- `/settings_set_interval`：設定股票與景氣對策信號輪詢秒數
+- `/status`：查看你的監控狀態
+- `/settings_show`：查看你的個人設定
+- `/settings_set_interval`：設定你的輪詢秒數
+- `/settings_enable`：啟用/停用你的排程
+- `/watchlist_show`：查看你的追蹤清單
 - `/watchlist_add`：新增追蹤股票
 - `/watchlist_update`：更新追蹤條件
 - `/watchlist_remove`：移除追蹤股票
-- `/sync_commands`：手動重新同步 Slash 指令（指令更新後可立即生效）
+- `/check_now`：立即手動檢查一次
 
-## 7. 指令沒更新時怎麼辦
+注意：若在伺服器頻道使用，Bot 會提示你改到私訊使用。
 
-1. 在 `.env` 設定 `DISCORD_GUILD_ID` 為你的伺服器 ID（建議）
-2. 重啟 bot（Railway 重新部署）
-3. 在伺服器內執行 `/sync_commands`
-4. 如果仍看不到新指令，確認 bot 邀請 scope 包含 `applications.commands`
+## 7. 每帳號資料儲存
 
-## 8. watchlist 規格
+預設寫入 `user_data.json`，結構是：
 
-每一檔股票欄位：
+- `users.<discord_user_id>.watchlist`
+- `users.<discord_user_id>.config`
+- `users.<discord_user_id>.state`
 
-- `symbol`: 股票代號（例：`2330.TW`、`AAPL`）
-- `name`: 顯示名稱（可空）
-- `up_pct`: 漲幅門檻（%）
-- `down_pct`: 跌幅門檻（%）
-- `target_high`: 目標高價
-- `target_low`: 目標低價
+因此每個帳號的設定互不影響。
 
-示例：`watchlist.example.json`
-
-## 9. 通知去重邏輯
-
-- 同一條件首次達標才通知一次
-- 回落到未達標後，再次達標才會再通知
-- 相關狀態保存在 `state.json`
-
-## 10. 景氣對策信號來源
+## 8. 景氣對策信號來源
 
 預設先查 API：
 
@@ -118,5 +99,3 @@ python bot.py
 若 API 失敗，再備援抓頁面：
 
 - `https://index.ndc.gov.tw/n/zh_twr`
-
-偵測到最新月份/日期變更時就推播通知。

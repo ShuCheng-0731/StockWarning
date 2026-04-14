@@ -1,8 +1,10 @@
 import asyncio
+import copy
 import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from html import unescape
 from pathlib import Path
@@ -20,6 +22,7 @@ from dotenv import load_dotenv
 YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
 NDC_ECONOMY_PAGE_URL = "https://index.ndc.gov.tw/n/zh_twr"
 NDC_ECONOMY_API_URL = "https://index.ndc.gov.tw/n/json/lightscore"
+
 DOWNLOAD_LINK_PATTERN = re.compile(
     r'href="([^"]*Download\.ashx[^"]+)"[^>]*>\s*(zip|xlsx|pdf|ods)\s*<',
     flags=re.IGNORECASE,
@@ -33,39 +36,35 @@ PERIOD_PATTERNS: list[tuple[re.Pattern[str], bool]] = [
     (re.compile(r"\b(1\d{2})([01]\d)\b"), True),
 ]
 
-DEFAULT_WATCHLIST = {
-    "stocks": [
-        {
-            "symbol": "2330.TW",
-            "name": "TSMC",
-            "up_pct": 3.0,
-            "down_pct": 3.0,
-            "target_high": None,
-            "target_low": None,
-        },
-        {
-            "symbol": "AAPL",
-            "name": "Apple",
-            "up_pct": 2.0,
-            "down_pct": 2.0,
-            "target_high": None,
-            "target_low": None,
-        },
-    ]
-}
+DEFAULT_WATCHLIST = [
+    {
+        "symbol": "2330.TW",
+        "name": "TSMC",
+        "up_pct": 3.0,
+        "down_pct": 3.0,
+        "target_high": None,
+        "target_low": None,
+    },
+    {
+        "symbol": "AAPL",
+        "name": "Apple",
+        "up_pct": 2.0,
+        "down_pct": 2.0,
+        "target_high": None,
+        "target_low": None,
+    },
+]
 
 
 @dataclass
 class Settings:
     discord_token: str
-    watchlist_path: Path
-    state_path: Path
-    config_path: Path
+    data_path: Path
     economy_page_url: str
     economy_api_url: str
     guild_id: int | None
+    poll_tick_sec: int
     manual_check_timeout_sec: int
-    default_channel_id: int | None
     default_stock_interval_sec: int
     default_economy_interval_sec: int
 
@@ -76,39 +75,32 @@ class Settings:
         if not token:
             raise ValueError("DISCORD_TOKEN 未設定")
 
-        channel_id_raw = os.getenv("DISCORD_CHANNEL_ID", "").strip()
-        default_channel_id = _optional_int(channel_id_raw)
-
         guild_raw = os.getenv("DISCORD_GUILD_ID", "").strip()
         guild_id = int(guild_raw) if guild_raw else None
 
+        data_path = Path(os.getenv("USER_DATA_PATH", "user_data.json")).resolve()
+        economy_page_url = os.getenv("ECONOMY_SOURCE_URL", NDC_ECONOMY_PAGE_URL).strip()
+        economy_api_url = os.getenv("ECONOMY_API_URL", NDC_ECONOMY_API_URL).strip()
+
+        poll_tick = _bounded_int(os.getenv("POLL_TICK_SEC"), fallback=30, minimum=10)
+        manual_timeout = _bounded_int(
+            os.getenv("MANUAL_CHECK_TIMEOUT_SEC"), fallback=45, minimum=10
+        )
         default_stock_interval = _bounded_int(
             os.getenv("STOCK_CHECK_INTERVAL_SEC"), fallback=300, minimum=30
         )
         default_economy_interval = _bounded_int(
             os.getenv("ECONOMY_CHECK_INTERVAL_SEC"), fallback=21600, minimum=300
         )
-        manual_timeout = _bounded_int(
-            os.getenv("MANUAL_CHECK_TIMEOUT_SEC"), fallback=45, minimum=10
-        )
-
-        watchlist = Path(os.getenv("WATCHLIST_PATH", "watchlist.json")).resolve()
-        state = Path(os.getenv("STATE_PATH", "state.json")).resolve()
-        config = Path(os.getenv("RUNTIME_CONFIG_PATH", "config.json")).resolve()
-
-        economy_page_url = os.getenv("ECONOMY_SOURCE_URL", NDC_ECONOMY_PAGE_URL).strip()
-        economy_api_url = os.getenv("ECONOMY_API_URL", NDC_ECONOMY_API_URL).strip()
 
         return cls(
             discord_token=token,
-            watchlist_path=watchlist,
-            state_path=state,
-            config_path=config,
+            data_path=data_path,
             economy_page_url=economy_page_url or NDC_ECONOMY_PAGE_URL,
             economy_api_url=economy_api_url or NDC_ECONOMY_API_URL,
             guild_id=guild_id,
+            poll_tick_sec=poll_tick,
             manual_check_timeout_sec=manual_timeout,
-            default_channel_id=default_channel_id,
             default_stock_interval_sec=default_stock_interval,
             default_economy_interval_sec=default_economy_interval,
         )
@@ -127,8 +119,7 @@ class StockRule:
     def from_dict(cls, row: dict[str, Any]) -> "StockRule":
         symbol = normalize_stock_symbol(row.get("symbol"))
         if not symbol:
-            raise ValueError("watchlist 中有股票缺少 symbol")
-
+            raise ValueError("股票缺少 symbol")
         return cls(
             symbol=symbol,
             name=_optional_str(row.get("name")),
@@ -159,12 +150,6 @@ def _optional_float(value: Any) -> float | None:
     return float(value)
 
 
-def _optional_int(value: Any) -> int | None:
-    if value is None or value == "":
-        return None
-    return int(value)
-
-
 def _optional_str(value: Any) -> str | None:
     if value is None:
         return None
@@ -183,7 +168,6 @@ def _bounded_int(value: Any, fallback: int, minimum: int) -> int:
 def read_json(path: Path, default: Any) -> Any:
     if not path.exists():
         return default
-
     with path.open("r", encoding="utf-8") as file:
         return json.load(file)
 
@@ -196,69 +180,146 @@ def write_json(path: Path, data: Any) -> None:
     temp_path.replace(path)
 
 
-def ensure_watchlist_exists(path: Path) -> None:
-    if path.exists():
-        return
-    write_json(path, DEFAULT_WATCHLIST)
-
-
-def load_watchlist_rows(path: Path) -> list[dict[str, Any]]:
-    ensure_watchlist_exists(path)
-    payload = read_json(path, {"stocks": []})
-    stocks_raw = payload.get("stocks", [])
-    if not isinstance(stocks_raw, list):
-        raise ValueError("watchlist.json 的 stocks 必須是陣列")
-
-    rows: list[dict[str, Any]] = []
-    for row in stocks_raw:
-        if not isinstance(row, dict):
-            continue
-        symbol = normalize_stock_symbol(row.get("symbol"))
-        if not symbol:
-            continue
-        rows.append(
-            {
-                "symbol": symbol,
-                "name": _optional_str(row.get("name")),
-                "up_pct": _optional_float(row.get("up_pct")),
-                "down_pct": _optional_float(row.get("down_pct")),
-                "target_high": _optional_float(row.get("target_high")),
-                "target_low": _optional_float(row.get("target_low")),
-            }
-        )
-    return rows
-
-
-def save_watchlist_rows(path: Path, rows: list[dict[str, Any]]) -> None:
-    write_json(path, {"stocks": rows})
-
-
-def load_watchlist(path: Path) -> list[StockRule]:
-    rows = load_watchlist_rows(path)
-    return [StockRule.from_dict(row) for row in rows]
-
-
-def load_runtime_config(settings: Settings) -> dict[str, Any]:
-    raw = read_json(settings.config_path, {})
-    channel_id = _optional_int(raw.get("notification_channel_id"))
-    if channel_id is None:
-        channel_id = settings.default_channel_id
-
-    config = {
-        "notification_channel_id": channel_id,
-        "stock_interval_sec": _bounded_int(
-            raw.get("stock_interval_sec"),
-            fallback=settings.default_stock_interval_sec,
-            minimum=30,
-        ),
-        "economy_interval_sec": _bounded_int(
-            raw.get("economy_interval_sec"),
-            fallback=settings.default_economy_interval_sec,
-            minimum=300,
-        ),
+def default_user_payload(settings: Settings) -> dict[str, Any]:
+    return {
+        "watchlist": copy.deepcopy(DEFAULT_WATCHLIST),
+        "config": {
+            "enabled": True,
+            "stock_interval_sec": settings.default_stock_interval_sec,
+            "economy_interval_sec": settings.default_economy_interval_sec,
+        },
+        "state": {
+            "stock_alerts": {},
+            "economy": {"last_release_id": None},
+            "last_stock_check_ts": 0.0,
+            "last_economy_check_ts": 0.0,
+        },
     }
-    write_json(settings.config_path, config)
-    return config
+
+
+class UserDataStore:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.path = settings.data_path
+        self.lock = asyncio.Lock()
+
+        raw = read_json(self.path, {"users": {}})
+        if not isinstance(raw, dict):
+            raw = {"users": {}}
+        users = raw.get("users", {})
+        if not isinstance(users, dict):
+            users = {}
+        self.data: dict[str, Any] = {"users": users}
+
+        for user_id in list(self.data["users"].keys()):
+            self._normalize_user_nolock(user_id)
+        write_json(self.path, self.data)
+
+    def _normalize_user_nolock(self, user_id: str) -> None:
+        users = self.data.setdefault("users", {})
+        payload = users.get(user_id)
+        if not isinstance(payload, dict):
+            payload = default_user_payload(self.settings)
+            users[user_id] = payload
+
+        watchlist = payload.get("watchlist")
+        if not isinstance(watchlist, list):
+            watchlist = copy.deepcopy(DEFAULT_WATCHLIST)
+        normalized_watchlist: list[dict[str, Any]] = []
+        for row in watchlist:
+            if not isinstance(row, dict):
+                continue
+            symbol = normalize_stock_symbol(row.get("symbol"))
+            if not symbol:
+                continue
+            normalized_watchlist.append(
+                {
+                    "symbol": symbol,
+                    "name": _optional_str(row.get("name")),
+                    "up_pct": _optional_float(row.get("up_pct")),
+                    "down_pct": _optional_float(row.get("down_pct")),
+                    "target_high": _optional_float(row.get("target_high")),
+                    "target_low": _optional_float(row.get("target_low")),
+                }
+            )
+        if not normalized_watchlist:
+            normalized_watchlist = copy.deepcopy(DEFAULT_WATCHLIST)
+        payload["watchlist"] = normalized_watchlist
+
+        config = payload.get("config")
+        if not isinstance(config, dict):
+            config = {}
+        payload["config"] = {
+            "enabled": bool(config.get("enabled", True)),
+            "stock_interval_sec": _bounded_int(
+                config.get("stock_interval_sec"),
+                fallback=self.settings.default_stock_interval_sec,
+                minimum=30,
+            ),
+            "economy_interval_sec": _bounded_int(
+                config.get("economy_interval_sec"),
+                fallback=self.settings.default_economy_interval_sec,
+                minimum=300,
+            ),
+        }
+
+        state = payload.get("state")
+        if not isinstance(state, dict):
+            state = {}
+        stock_alerts = state.get("stock_alerts")
+        if not isinstance(stock_alerts, dict):
+            stock_alerts = {}
+        economy = state.get("economy")
+        if not isinstance(economy, dict):
+            economy = {}
+        payload["state"] = {
+            "stock_alerts": stock_alerts,
+            "economy": {"last_release_id": economy.get("last_release_id")},
+            "last_stock_check_ts": float(state.get("last_stock_check_ts", 0.0) or 0.0),
+            "last_economy_check_ts": float(
+                state.get("last_economy_check_ts", 0.0) or 0.0
+            ),
+        }
+
+    def _ensure_user_nolock(self, user_id: int) -> str:
+        key = str(user_id)
+        users = self.data.setdefault("users", {})
+        if key not in users:
+            users[key] = default_user_payload(self.settings)
+        self._normalize_user_nolock(key)
+        return key
+
+    async def ensure_user(self, user_id: int) -> dict[str, Any]:
+        async with self.lock:
+            key = self._ensure_user_nolock(user_id)
+            write_json(self.path, self.data)
+            return copy.deepcopy(self.data["users"][key])
+
+    async def get_user(self, user_id: int) -> dict[str, Any]:
+        async with self.lock:
+            key = self._ensure_user_nolock(user_id)
+            return copy.deepcopy(self.data["users"][key])
+
+    async def list_user_ids(self) -> list[int]:
+        async with self.lock:
+            ids: list[int] = []
+            for key in self.data.get("users", {}).keys():
+                try:
+                    ids.append(int(key))
+                except ValueError:
+                    continue
+            return ids
+
+    async def update_user(
+        self, user_id: int, mutator: Callable[[dict[str, Any]], None]
+    ) -> dict[str, Any]:
+        async with self.lock:
+            key = self._ensure_user_nolock(user_id)
+            payload = self.data["users"][key]
+            mutator(payload)
+            self._normalize_user_nolock(key)
+            write_json(self.path, self.data)
+            return copy.deepcopy(self.data["users"][key])
 
 
 def roc_to_iso(roc_date: str) -> str:
@@ -353,7 +414,6 @@ def format_stock_rule_line(index: int, rule: StockRule) -> str:
         conditions.append(f"高於{rule.target_high:.2f}")
     if rule.target_low is not None:
         conditions.append(f"低於{rule.target_low:.2f}")
-
     condition_text = "、".join(conditions) if conditions else "未設定條件"
     return f"{index}. {rule.symbol} ({name}) | {condition_text}"
 
@@ -362,38 +422,15 @@ class StockWarningBot(commands.Bot):
     def __init__(self, settings: Settings):
         super().__init__(command_prefix="!", intents=discord.Intents.default())
         self.settings = settings
+        self.store = UserDataStore(settings)
         self.session: aiohttp.ClientSession | None = None
-        self.state_lock = asyncio.Lock()
-        self.config_lock = asyncio.Lock()
-        self.state = read_json(
-            settings.state_path,
-            {"stock_alerts": {}, "economy": {"last_release_id": None}},
-        )
-        self.runtime_config = load_runtime_config(settings)
         self.background_tasks: list[asyncio.Task[Any]] = []
         self._guild_sync_done = False
+        self._economy_cache: dict[str, Any] = {"ts": 0.0, "data": None}
 
     async def setup_hook(self) -> None:
-        timeout = aiohttp.ClientTimeout(total=20)
-        self.session = aiohttp.ClientSession(timeout=timeout)
-        self.background_tasks.append(
-            asyncio.create_task(
-                self._run_periodic_loop(
-                    loop_name="stock",
-                    interval_getter=self.get_stock_interval_sec,
-                    callback=self.check_stocks,
-                )
-            )
-        )
-        self.background_tasks.append(
-            asyncio.create_task(
-                self._run_periodic_loop(
-                    loop_name="economy",
-                    interval_getter=self.get_economy_interval_sec,
-                    callback=self.check_economy_release,
-                )
-            )
-        )
+        self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
+        self.background_tasks.append(asyncio.create_task(self._run_scheduler_loop()))
 
         try:
             if self.settings.guild_id:
@@ -406,7 +443,6 @@ class StockWarningBot(commands.Bot):
                 synced = await self.sync_global_commands()
                 logging.info("已同步 %s 個全域指令", synced)
         except Exception:
-            # 指令同步失敗不應影響 bot 啟動，避免整個服務中斷。
             logging.exception("setup_hook 指令同步失敗，稍後 on_ready 會再嘗試。")
 
     async def close(self) -> None:
@@ -422,9 +458,6 @@ class StockWarningBot(commands.Bot):
         logging.info("Bot 已上線：%s", self.user)
         if self._guild_sync_done:
             return
-
-        # 沒有設定 DISCORD_GUILD_ID 時，嘗試把指令同步到目前加入的伺服器，
-        # 讓更新可以立即生效，不用等全域同步延遲。
         if not self.settings.guild_id and self.guilds:
             synced_guilds = 0
             for guild in self.guilds:
@@ -446,89 +479,74 @@ class StockWarningBot(commands.Bot):
         synced = await self.tree.sync(guild=guild)
         return len(synced)
 
-    def get_notification_channel_id(self) -> int | None:
-        return _optional_int(self.runtime_config.get("notification_channel_id"))
-
-    def get_stock_interval_sec(self) -> int:
-        return _bounded_int(
-            self.runtime_config.get("stock_interval_sec"),
-            fallback=self.settings.default_stock_interval_sec,
-            minimum=30,
-        )
-
-    def get_economy_interval_sec(self) -> int:
-        return _bounded_int(
-            self.runtime_config.get("economy_interval_sec"),
-            fallback=self.settings.default_economy_interval_sec,
-            minimum=300,
-        )
-
-    async def set_notification_channel(self, channel_id: int | None) -> None:
-        async with self.config_lock:
-            self.runtime_config["notification_channel_id"] = channel_id
-            write_json(self.settings.config_path, self.runtime_config)
-
-    async def set_intervals(
-        self, stock_interval_sec: int | None = None, economy_interval_sec: int | None = None
-    ) -> None:
-        async with self.config_lock:
-            if stock_interval_sec is not None:
-                self.runtime_config["stock_interval_sec"] = max(30, int(stock_interval_sec))
-            if economy_interval_sec is not None:
-                self.runtime_config["economy_interval_sec"] = max(
-                    300, int(economy_interval_sec)
-                )
-            write_json(self.settings.config_path, self.runtime_config)
-
-    async def clear_symbol_alert_state(self, symbol: str) -> None:
-        async with self.state_lock:
-            stock_state = self.state.setdefault("stock_alerts", {})
-            keys_to_remove = [
-                key for key in list(stock_state.keys()) if key.startswith(f"{symbol}|")
-            ]
-            if not keys_to_remove:
-                return
-            for key in keys_to_remove:
-                stock_state.pop(key, None)
-            write_json(self.settings.state_path, self.state)
-
-    async def _run_periodic_loop(
-        self,
-        loop_name: str,
-        interval_getter: Callable[[], int],
-        callback: Callable[[], Any],
-    ) -> None:
+    async def _run_scheduler_loop(self) -> None:
         await self.wait_until_ready()
         while not self.is_closed():
-            start = monotonic()
+            started = monotonic()
             try:
-                await callback()
+                await self.run_due_checks()
             except Exception:
-                logging.exception("週期任務失敗: %s", loop_name)
-            elapsed = monotonic() - start
-            interval_sec = max(1, int(interval_getter()))
-            await asyncio.sleep(max(1.0, interval_sec - elapsed))
+                logging.exception("排程檢查失敗")
+            elapsed = monotonic() - started
+            await asyncio.sleep(max(1.0, self.settings.poll_tick_sec - elapsed))
 
-    async def send_alert(self, message: str) -> None:
-        channel_id = self.get_notification_channel_id()
-        if not channel_id:
-            logging.info("通知頻道尚未設定，略過通知。")
+    async def run_due_checks(self) -> None:
+        user_ids = await self.store.list_user_ids()
+        if not user_ids:
             return
+        now_ts = time.time()
 
-        channel = self.get_channel(channel_id)
-        if channel is None:
-            channel = await self.fetch_channel(channel_id)
+        for user_id in user_ids:
+            user = await self.store.get_user(user_id)
+            config = user["config"]
+            state = user["state"]
+            if not config.get("enabled", True):
+                continue
 
-        if not isinstance(channel, discord.abc.Messageable):
-            raise RuntimeError("設定的通知頻道不是可發訊息頻道")
+            if now_ts - float(state.get("last_stock_check_ts", 0.0)) >= float(
+                config.get("stock_interval_sec", self.settings.default_stock_interval_sec)
+            ):
+                try:
+                    await self.check_stocks_for_user(user_id, user)
+                except Exception:
+                    logging.exception("使用者 %s 股票檢查失敗", user_id)
+                await self.store.update_user(
+                    user_id, lambda p: p["state"].update({"last_stock_check_ts": now_ts})
+                )
 
-        await channel.send(message)
+            user = await self.store.get_user(user_id)
+            config = user["config"]
+            state = user["state"]
+            if now_ts - float(state.get("last_economy_check_ts", 0.0)) >= float(
+                config.get("economy_interval_sec", self.settings.default_economy_interval_sec)
+            ):
+                try:
+                    await self.check_economy_for_user(user_id, user)
+                except Exception:
+                    logging.exception("使用者 %s 景氣檢查失敗", user_id)
+                await self.store.update_user(
+                    user_id, lambda p: p["state"].update({"last_economy_check_ts": now_ts})
+                )
 
-    async def check_stocks(self) -> None:
+    async def send_alert_to_user(self, user_id: int, message: str) -> None:
+        target_user = self.get_user(user_id)
+        if target_user is None:
+            target_user = await self.fetch_user(user_id)
+        await target_user.send(message)
+
+    async def check_stocks_for_user(self, user_id: int, user_payload: dict[str, Any]) -> None:
         if not self.session:
             return
 
-        rules = load_watchlist(self.settings.watchlist_path)
+        rows = user_payload.get("watchlist", [])
+        rules: list[StockRule] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                rules.append(StockRule.from_dict(row))
+            except ValueError:
+                continue
         if not rules:
             return
 
@@ -536,10 +554,8 @@ class StockWarningBot(commands.Bot):
         quotes = await fetch_quotes(self.session, symbols)
         pending_alerts: list[str] = []
 
-        async with self.state_lock:
-            stock_state = self.state.setdefault("stock_alerts", {})
-            changed = False
-
+        def mutator(payload: dict[str, Any]) -> None:
+            stock_state = payload["state"].setdefault("stock_alerts", {})
             for rule in rules:
                 quote = quotes.get(rule.symbol)
                 if not quote:
@@ -590,7 +606,6 @@ class StockWarningBot(commands.Bot):
                     was_hit = bool(stock_state.get(state_key, False))
                     if is_hit and not was_hit:
                         stock_state[state_key] = True
-                        changed = True
                         pending_alerts.append(
                             "\n".join(
                                 [
@@ -604,18 +619,41 @@ class StockWarningBot(commands.Bot):
                         )
                     elif (not is_hit) and was_hit:
                         stock_state[state_key] = False
-                        changed = True
 
-            if changed:
-                write_json(self.settings.state_path, self.state)
-
+        await self.store.update_user(user_id, mutator)
         for message in pending_alerts:
-            await self.send_alert(message)
+            try:
+                await self.send_alert_to_user(user_id, message)
+            except Exception:
+                logging.exception("傳送使用者 %s 股票通知失敗", user_id)
+
+    async def get_latest_economy_release(self) -> dict[str, Any] | None:
+        now_ts = time.time()
+        cached = self._economy_cache.get("data")
+        cached_ts = float(self._economy_cache.get("ts", 0.0) or 0.0)
+        if cached and (now_ts - cached_ts) < 60:
+            return cached
+
+        release_data: dict[str, Any] | None = None
+        try:
+            release_data = await self._fetch_economy_release_from_api()
+        except Exception:
+            logging.exception("景氣對策信號 API 檢查失敗，改用網頁備援。")
+
+        if release_data is None:
+            try:
+                release_data = await self._fetch_economy_release_from_page()
+            except Exception:
+                logging.exception("景氣對策信號網頁備援檢查也失敗。")
+                return None
+
+        if release_data:
+            self._economy_cache = {"ts": now_ts, "data": release_data}
+        return release_data
 
     async def _fetch_economy_release_from_api(self) -> dict[str, Any] | None:
         if not self.session:
             return None
-
         headers = {
             "User-Agent": "Mozilla/5.0 StockWarningBot/1.0",
             "Accept": "application/json,text/plain,*/*",
@@ -631,15 +669,11 @@ class StockWarningBot(commands.Bot):
         if not latest_period:
             raise RuntimeError("無法從景氣對策信號 API 解析最新月份")
 
-        return {
-            "release_id": f"period:{latest_period}",
-            "display": latest_period,
-        }
+        return {"release_id": f"period:{latest_period}", "display": latest_period}
 
     async def _fetch_economy_release_from_page(self) -> dict[str, Any] | None:
         if not self.session:
             return None
-
         headers = {"User-Agent": "Mozilla/5.0 StockWarningBot/1.0"}
         async with self.session.get(self.settings.economy_page_url, headers=headers) as resp:
             if resp.status >= 400:
@@ -656,23 +690,11 @@ class StockWarningBot(commands.Bot):
             }
         return None
 
-    async def check_economy_release(self) -> None:
-        release_data: dict[str, Any] | None = None
-
-        try:
-            release_data = await self._fetch_economy_release_from_api()
-        except Exception:
-            logging.exception("景氣對策信號 API 檢查失敗，改用網頁備援。")
-
-        if release_data is None:
-            try:
-                release_data = await self._fetch_economy_release_from_page()
-            except Exception:
-                logging.exception("景氣對策信號網頁備援檢查也失敗。")
-                return
-
+    async def check_economy_for_user(
+        self, user_id: int, user_payload: dict[str, Any]
+    ) -> None:
+        release_data = await self.get_latest_economy_release()
         if not release_data:
-            logging.warning("找不到可用的景氣對策信號最新資料。")
             return
 
         latest_id = release_data.get("release_id")
@@ -680,19 +702,18 @@ class StockWarningBot(commands.Bot):
             return
 
         should_notify = False
-        async with self.state_lock:
-            economy_state = self.state.setdefault("economy", {})
-            previous = economy_state.get("last_release_id") or economy_state.get(
-                "last_release_date"
-            )
+
+        def mutator(payload: dict[str, Any]) -> None:
+            nonlocal should_notify
+            economy_state = payload["state"].setdefault("economy", {})
+            previous = economy_state.get("last_release_id")
             if previous is None:
                 economy_state["last_release_id"] = latest_id
-                write_json(self.settings.state_path, self.state)
             elif previous != latest_id:
                 economy_state["last_release_id"] = latest_id
-                write_json(self.settings.state_path, self.state)
                 should_notify = True
 
+        await self.store.update_user(user_id, mutator)
         if not should_notify:
             return
 
@@ -709,16 +730,42 @@ class StockWarningBot(commands.Bot):
         if links.get("zip"):
             lines.append(f"zip: {links['zip']}")
 
-        await self.send_alert("\n".join(lines))
+        try:
+            await self.send_alert_to_user(user_id, "\n".join(lines))
+        except Exception:
+            logging.exception("傳送使用者 %s 景氣通知失敗", user_id)
+
+
+async def ensure_dm_interaction(interaction: discord.Interaction) -> bool:
+    if interaction.guild_id is not None:
+        await interaction.response.send_message(
+            "這個機器人改為私訊模式，請在與機器人的私訊中使用指令。",
+            ephemeral=True,
+        )
+        return False
+    return True
 
 
 def build_bot(settings: Settings) -> StockWarningBot:
     bot = StockWarningBot(settings)
 
-    async def run_manual_check(label: str, callback: Callable[[], Any]) -> str:
+    async def run_manual_check(user_id: int, label: str, callback: Callable[[], Any]) -> str:
         try:
             await asyncio.wait_for(
                 callback(), timeout=settings.manual_check_timeout_sec
+            )
+            await bot.store.update_user(
+                user_id,
+                lambda payload: payload["state"].update(
+                    {
+                        "last_stock_check_ts": time.time()
+                        if label == "股票檢查"
+                        else payload["state"].get("last_stock_check_ts", 0.0),
+                        "last_economy_check_ts": time.time()
+                        if label == "景氣對策信號檢查"
+                        else payload["state"].get("last_economy_check_ts", 0.0),
+                    }
+                ),
             )
             return f"- {label}: 完成"
         except asyncio.TimeoutError:
@@ -728,127 +775,115 @@ def build_bot(settings: Settings) -> StockWarningBot:
             logging.exception("手動檢查失敗: %s", label)
             return f"- {label}: 失敗（{type(exc).__name__}: {exc}）"
 
-    @bot.tree.command(name="status", description="查看機器人監控狀態")
+    @bot.tree.command(name="status", description="查看你的監控狀態（私訊模式）")
     async def status(interaction: discord.Interaction) -> None:
-        rules = load_watchlist(settings.watchlist_path)
-        channel_id = bot.get_notification_channel_id()
-        channel_text = f"<#{channel_id}>" if channel_id else "未設定"
-        await interaction.response.send_message(
-            "\n".join(
-                [
-                    "StockWarning Bot 狀態:",
-                    f"- 追蹤股票數: {len(rules)}",
-                    f"- 股票輪詢: {bot.get_stock_interval_sec()} 秒",
-                    f"- 景氣燈號輪詢: {bot.get_economy_interval_sec()} 秒",
-                    f"- 通知頻道: {channel_text}",
-                ]
-            ),
-            ephemeral=True,
-        )
-
-    @bot.tree.command(name="settings_show", description="查看通知頻道與輪詢秒數")
-    async def settings_show(interaction: discord.Interaction) -> None:
-        channel_id = bot.get_notification_channel_id()
-        channel_text = f"<#{channel_id}>" if channel_id else "未設定"
-        await interaction.response.send_message(
-            "\n".join(
-                [
-                    "目前設定:",
-                    f"- 通知頻道: {channel_text}",
-                    f"- 股票輪詢秒數: {bot.get_stock_interval_sec()}",
-                    f"- 景氣對策信號輪詢秒數: {bot.get_economy_interval_sec()}",
-                ]
-            ),
-            ephemeral=True,
-        )
-
-    @bot.tree.command(name="sync_commands", description="手動重新同步 Slash 指令")
-    @app_commands.checks.has_permissions(manage_guild=True)
-    async def sync_commands(interaction: discord.Interaction) -> None:
-        if interaction.guild_id is None:
-            await interaction.response.send_message(
-                "請在伺服器頻道內使用這個指令。", ephemeral=True
-            )
+        if not await ensure_dm_interaction(interaction):
             return
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        try:
-            synced = await bot.sync_commands_to_guild(interaction.guild_id)
-            await interaction.followup.send(
-                f"已重新同步 {synced} 個指令到目前伺服器。", ephemeral=True
-            )
-        except Exception as exc:
-            logging.exception("手動同步指令失敗")
-            await interaction.followup.send(
-                f"同步失敗：{type(exc).__name__}: {exc}", ephemeral=True
-            )
+        user = await bot.store.ensure_user(interaction.user.id)
+        config = user["config"]
+        lines = [
+            "你的 StockWarning 狀態:",
+            f"- 追蹤股票數: {len(user['watchlist'])}",
+            f"- 股票輪詢秒數: {config['stock_interval_sec']}",
+            f"- 景氣輪詢秒數: {config['economy_interval_sec']}",
+            f"- 啟用通知: {'是' if config.get('enabled', True) else '否'}",
+        ]
+        await interaction.response.send_message("\n".join(lines))
 
-    @bot.tree.command(name="settings_set_channel", description="設定通知頻道")
-    @app_commands.checks.has_permissions(manage_guild=True)
-    async def settings_set_channel(
-        interaction: discord.Interaction, channel: discord.TextChannel
-    ) -> None:
-        await bot.set_notification_channel(channel.id)
+    @bot.tree.command(name="settings_show", description="查看你目前的個人設定")
+    async def settings_show(interaction: discord.Interaction) -> None:
+        if not await ensure_dm_interaction(interaction):
+            return
+        user = await bot.store.ensure_user(interaction.user.id)
+        config = user["config"]
         await interaction.response.send_message(
-            f"已設定通知頻道為 {channel.mention}", ephemeral=True
+            "\n".join(
+                [
+                    "你的個人設定:",
+                    f"- 股票輪詢秒數: {config['stock_interval_sec']}",
+                    f"- 景氣輪詢秒數: {config['economy_interval_sec']}",
+                    f"- 啟用通知: {'是' if config.get('enabled', True) else '否'}",
+                ]
+            )
         )
 
-    @bot.tree.command(
-        name="settings_set_interval",
-        description="設定股票/景氣對策信號輪詢秒數（可只改一個）",
-    )
-    @app_commands.checks.has_permissions(manage_guild=True)
+    @bot.tree.command(name="settings_set_interval", description="設定你的輪詢秒數")
     async def settings_set_interval(
         interaction: discord.Interaction,
         stock_seconds: int | None = None,
         economy_seconds: int | None = None,
     ) -> None:
+        if not await ensure_dm_interaction(interaction):
+            return
         if stock_seconds is None and economy_seconds is None:
             await interaction.response.send_message(
-                "請至少填一個參數：`stock_seconds` 或 `economy_seconds`。",
-                ephemeral=True,
+                "請至少填一個參數：`stock_seconds` 或 `economy_seconds`。"
             )
             return
         if stock_seconds is not None and stock_seconds < 30:
-            await interaction.response.send_message(
-                "`stock_seconds` 最小值是 30 秒。", ephemeral=True
-            )
+            await interaction.response.send_message("`stock_seconds` 最小值是 30 秒。")
             return
         if economy_seconds is not None and economy_seconds < 300:
-            await interaction.response.send_message(
-                "`economy_seconds` 最小值是 300 秒。", ephemeral=True
-            )
+            await interaction.response.send_message("`economy_seconds` 最小值是 300 秒。")
             return
 
-        await bot.set_intervals(stock_seconds, economy_seconds)
+        def mutator(payload: dict[str, Any]) -> None:
+            if stock_seconds is not None:
+                payload["config"]["stock_interval_sec"] = stock_seconds
+            if economy_seconds is not None:
+                payload["config"]["economy_interval_sec"] = economy_seconds
+
+        updated = await bot.store.update_user(interaction.user.id, mutator)
+        config = updated["config"]
         await interaction.response.send_message(
             "\n".join(
                 [
-                    "已更新輪詢設定。",
-                    f"- 股票輪詢秒數: {bot.get_stock_interval_sec()}",
-                    f"- 景氣對策信號輪詢秒數: {bot.get_economy_interval_sec()}",
+                    "已更新你的輪詢設定。",
+                    f"- 股票輪詢秒數: {config['stock_interval_sec']}",
+                    f"- 景氣輪詢秒數: {config['economy_interval_sec']}",
                 ]
-            ),
-            ephemeral=True,
+            )
         )
 
-    @bot.tree.command(name="watchlist_show", description="查看追蹤股票清單")
+    @bot.tree.command(name="settings_enable", description="開啟或關閉你的通知排程")
+    async def settings_enable(interaction: discord.Interaction, enabled: bool) -> None:
+        if not await ensure_dm_interaction(interaction):
+            return
+        await bot.store.update_user(
+            interaction.user.id, lambda payload: payload["config"].update({"enabled": enabled})
+        )
+        await interaction.response.send_message(
+            f"已將你的通知排程設定為：{'啟用' if enabled else '停用'}。"
+        )
+
+    @bot.tree.command(name="watchlist_show", description="查看你的追蹤股票清單")
     async def watchlist_show(interaction: discord.Interaction) -> None:
-        rules = load_watchlist(settings.watchlist_path)
+        if not await ensure_dm_interaction(interaction):
+            return
+        user = await bot.store.ensure_user(interaction.user.id)
+        rows = user.get("watchlist", [])
+        rules: list[StockRule] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                rules.append(StockRule.from_dict(row))
+            except ValueError:
+                continue
+
         if not rules:
-            await interaction.response.send_message("目前沒有追蹤股票。", ephemeral=True)
+            await interaction.response.send_message("你目前沒有追蹤股票。")
             return
 
-        lines = ["追蹤股票清單:"]
+        lines = ["你的追蹤股票清單:"]
         for index, rule in enumerate(rules, start=1):
             lines.append(format_stock_rule_line(index, rule))
             if len("\n".join(lines)) > 1700:
-                lines.append("...清單過長，請縮小追蹤數量或拆分管理。")
+                lines.append("...清單過長，請縮小追蹤數量。")
                 break
+        await interaction.response.send_message("\n".join(lines))
 
-        await interaction.response.send_message("\n".join(lines), ephemeral=True)
-
-    @bot.tree.command(name="watchlist_add", description="新增追蹤股票")
-    @app_commands.checks.has_permissions(manage_guild=True)
+    @bot.tree.command(name="watchlist_add", description="新增你的追蹤股票")
     async def watchlist_add(
         interaction: discord.Interaction,
         symbol: str,
@@ -858,55 +893,56 @@ def build_bot(settings: Settings) -> StockWarningBot:
         target_high: float | None = None,
         target_low: float | None = None,
     ) -> None:
+        if not await ensure_dm_interaction(interaction):
+            return
         symbol = normalize_stock_symbol(symbol)
         if not symbol:
-            await interaction.response.send_message("`symbol` 不能是空值。", ephemeral=True)
+            await interaction.response.send_message("`symbol` 不能是空值。")
             return
         if up_pct is not None and up_pct < 0:
-            await interaction.response.send_message(
-                "`up_pct` 請填正數或 0。", ephemeral=True
-            )
+            await interaction.response.send_message("`up_pct` 請填正數或 0。")
             return
         if down_pct is not None and down_pct < 0:
-            await interaction.response.send_message(
-                "`down_pct` 請填正數或 0。", ephemeral=True
-            )
+            await interaction.response.send_message("`down_pct` 請填正數或 0。")
             return
         if (
             target_high is not None
             and target_low is not None
             and target_high < target_low
         ):
-            await interaction.response.send_message(
-                "`target_high` 不能小於 `target_low`。", ephemeral=True
-            )
+            await interaction.response.send_message("`target_high` 不能小於 `target_low`。")
             return
 
-        rows = load_watchlist_rows(settings.watchlist_path)
-        if any(row.get("symbol") == symbol for row in rows):
-            await interaction.response.send_message(
-                f"{symbol} 已在追蹤清單中。", ephemeral=True
+        duplicate = False
+
+        def mutator(payload: dict[str, Any]) -> None:
+            nonlocal duplicate
+            rows = payload["watchlist"]
+            if any(normalize_stock_symbol(row.get("symbol")) == symbol for row in rows):
+                duplicate = True
+                return
+            rows.append(
+                StockRule(
+                    symbol=symbol,
+                    name=_optional_str(name),
+                    up_pct=up_pct,
+                    down_pct=down_pct,
+                    target_high=target_high,
+                    target_low=target_low,
+                ).to_dict()
             )
+
+        updated = await bot.store.update_user(interaction.user.id, mutator)
+        if duplicate:
+            await interaction.response.send_message(f"{symbol} 已在你的追蹤清單中。")
             return
 
-        new_rule = StockRule(
-            symbol=symbol,
-            name=_optional_str(name),
-            up_pct=up_pct,
-            down_pct=down_pct,
-            target_high=target_high,
-            target_low=target_low,
-        )
-        rows.append(new_rule.to_dict())
-        save_watchlist_rows(settings.watchlist_path, rows)
-
+        rules = [StockRule.from_dict(row) for row in updated["watchlist"]]
         await interaction.response.send_message(
-            f"已新增追蹤：{format_stock_rule_line(len(rows), new_rule)}",
-            ephemeral=True,
+            f"已新增追蹤：{format_stock_rule_line(len(rules), rules[-1])}"
         )
 
-    @bot.tree.command(name="watchlist_update", description="更新追蹤股票條件")
-    @app_commands.checks.has_permissions(manage_guild=True)
+    @bot.tree.command(name="watchlist_update", description="更新你的追蹤股票條件")
     async def watchlist_update(
         interaction: discord.Interaction,
         symbol: str,
@@ -920,34 +956,29 @@ def build_bot(settings: Settings) -> StockWarningBot:
         clear_target_high: bool = False,
         clear_target_low: bool = False,
     ) -> None:
+        if not await ensure_dm_interaction(interaction):
+            return
         symbol = normalize_stock_symbol(symbol)
         if not symbol:
-            await interaction.response.send_message("`symbol` 不能是空值。", ephemeral=True)
+            await interaction.response.send_message("`symbol` 不能是空值。")
+            return
+        if up_pct is not None and up_pct < 0:
+            await interaction.response.send_message("`up_pct` 請填正數或 0。")
+            return
+        if down_pct is not None and down_pct < 0:
+            await interaction.response.send_message("`down_pct` 請填正數或 0。")
             return
 
-        rows = load_watchlist_rows(settings.watchlist_path)
+        payload = await bot.store.get_user(interaction.user.id)
+        rows = copy.deepcopy(payload["watchlist"])
         target_row = None
         for row in rows:
-            if row.get("symbol") == symbol:
+            if normalize_stock_symbol(row.get("symbol")) == symbol:
                 target_row = row
                 break
 
         if target_row is None:
-            await interaction.response.send_message(
-                f"找不到 {symbol}，請先用 `/watchlist_add` 新增。",
-                ephemeral=True,
-            )
-            return
-
-        if up_pct is not None and up_pct < 0:
-            await interaction.response.send_message(
-                "`up_pct` 請填正數或 0。", ephemeral=True
-            )
-            return
-        if down_pct is not None and down_pct < 0:
-            await interaction.response.send_message(
-                "`down_pct` 請填正數或 0。", ephemeral=True
-            )
+            await interaction.response.send_message(f"找不到 {symbol}，請先新增。")
             return
 
         if name is not None:
@@ -973,71 +1004,89 @@ def build_bot(settings: Settings) -> StockWarningBot:
         high = _optional_float(target_row.get("target_high"))
         low = _optional_float(target_row.get("target_low"))
         if high is not None and low is not None and high < low:
-            await interaction.response.send_message(
-                "`target_high` 不能小於 `target_low`。", ephemeral=True
-            )
+            await interaction.response.send_message("`target_high` 不能小於 `target_low`。")
             return
 
-        save_watchlist_rows(settings.watchlist_path, rows)
-        updated = StockRule.from_dict(target_row)
+        updated = await bot.store.update_user(
+            interaction.user.id, lambda p: p.update({"watchlist": rows})
+        )
+        rules = [StockRule.from_dict(row) for row in updated["watchlist"]]
+        target_rule = next((rule for rule in rules if rule.symbol == symbol), None)
+        if target_rule is None:
+            await interaction.response.send_message("更新失敗，請重試。")
+            return
         await interaction.response.send_message(
-            f"已更新：{format_stock_rule_line(1, updated)[3:]}",
-            ephemeral=True,
+            f"已更新：{format_stock_rule_line(1, target_rule)[3:]}"
         )
 
-    @bot.tree.command(name="watchlist_remove", description="移除追蹤股票")
-    @app_commands.checks.has_permissions(manage_guild=True)
+    @bot.tree.command(name="watchlist_remove", description="移除你的追蹤股票")
     async def watchlist_remove(interaction: discord.Interaction, symbol: str) -> None:
+        if not await ensure_dm_interaction(interaction):
+            return
         symbol = normalize_stock_symbol(symbol)
         if not symbol:
-            await interaction.response.send_message("`symbol` 不能是空值。", ephemeral=True)
+            await interaction.response.send_message("`symbol` 不能是空值。")
             return
 
-        rows = load_watchlist_rows(settings.watchlist_path)
-        before = len(rows)
-        rows = [row for row in rows if row.get("symbol") != symbol]
-        if len(rows) == before:
-            await interaction.response.send_message(
-                f"{symbol} 不在追蹤清單中。", ephemeral=True
-            )
+        removed = False
+
+        def mutator(payload: dict[str, Any]) -> None:
+            nonlocal removed
+            rows = payload["watchlist"]
+            before = len(rows)
+            payload["watchlist"] = [
+                row
+                for row in rows
+                if normalize_stock_symbol(row.get("symbol")) != symbol
+            ]
+            removed = len(payload["watchlist"]) != before
+            if removed:
+                stock_alerts = payload["state"].setdefault("stock_alerts", {})
+                for key in list(stock_alerts.keys()):
+                    if key.startswith(f"{symbol}|"):
+                        stock_alerts.pop(key, None)
+
+        await bot.store.update_user(interaction.user.id, mutator)
+        if not removed:
+            await interaction.response.send_message(f"{symbol} 不在你的追蹤清單中。")
             return
+        await interaction.response.send_message(f"已移除追蹤股票：{symbol}")
 
-        save_watchlist_rows(settings.watchlist_path, rows)
-        await bot.clear_symbol_alert_state(symbol)
-        await interaction.response.send_message(
-            f"已移除追蹤股票：{symbol}", ephemeral=True
-        )
-
-    @bot.tree.command(name="check_now", description="立即檢查一次股票與景氣對策信號")
+    @bot.tree.command(name="check_now", description="立即檢查一次你的股票與景氣對策信號")
     async def check_now(interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        if not await ensure_dm_interaction(interaction):
+            return
+        await bot.store.ensure_user(interaction.user.id)
+        await interaction.response.defer(thinking=True)
+
+        user_payload = await bot.store.get_user(interaction.user.id)
         results = await asyncio.gather(
-            run_manual_check("股票檢查", bot.check_stocks),
-            run_manual_check("景氣對策信號檢查", bot.check_economy_release),
+            run_manual_check(
+                interaction.user.id,
+                "股票檢查",
+                lambda: bot.check_stocks_for_user(interaction.user.id, user_payload),
+            ),
+            run_manual_check(
+                interaction.user.id,
+                "景氣對策信號檢查",
+                lambda: bot.check_economy_for_user(interaction.user.id, user_payload),
+            ),
         )
-        await interaction.followup.send(
-            "\n".join(["已完成一次手動檢查。", *results]),
-            ephemeral=True,
-        )
+        await interaction.followup.send("\n".join(["已完成一次手動檢查。", *results]))
 
     @bot.tree.error
     async def on_app_command_error(
         interaction: discord.Interaction, error: app_commands.AppCommandError
     ) -> None:
         logging.exception("Slash 指令失敗", exc_info=error)
-
-        if isinstance(error, app_commands.MissingPermissions):
-            message = "你需要 `管理伺服器` 權限才能使用這個指令。"
-        elif isinstance(error, app_commands.CheckFailure):
-            message = "你目前沒有權限使用這個指令。"
-        else:
-            message = f"指令執行失敗：{type(error).__name__}"
-
+        message = f"指令執行失敗：{type(error).__name__}"
         try:
             if interaction.response.is_done():
-                await interaction.followup.send(message, ephemeral=True)
+                await interaction.followup.send(message, ephemeral=interaction.guild_id is not None)
             else:
-                await interaction.response.send_message(message, ephemeral=True)
+                await interaction.response.send_message(
+                    message, ephemeral=interaction.guild_id is not None
+                )
         except Exception:
             logging.exception("無法回覆 slash 指令錯誤訊息")
 
@@ -1050,7 +1099,6 @@ def main() -> None:
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
     settings = Settings.from_env()
-    ensure_watchlist_exists(settings.watchlist_path)
     bot = build_bot(settings)
     bot.run(settings.discord_token, log_handler=None)
 
