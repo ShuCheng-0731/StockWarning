@@ -66,11 +66,9 @@ class Settings:
     data_path: Path
     economy_page_url: str
     economy_zip_url: str | None
-    guild_id: int | None
     poll_tick_sec: int
     manual_check_timeout_sec: int
     default_stock_interval_sec: int
-    default_economy_interval_sec: int
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -78,9 +76,6 @@ class Settings:
         token = os.getenv("DISCORD_TOKEN", "").strip()
         if not token:
             raise ValueError("DISCORD_TOKEN 未設定")
-
-        guild_raw = os.getenv("DISCORD_GUILD_ID", "").strip()
-        guild_id = int(guild_raw) if guild_raw else None
 
         data_path = Path(os.getenv("USER_DATA_PATH", "user_data.json")).resolve()
         economy_page_url = os.getenv("ECONOMY_SOURCE_URL", NDC_ECONOMY_PAGE_URL).strip()
@@ -93,20 +88,15 @@ class Settings:
         default_stock_interval = _bounded_int(
             os.getenv("STOCK_CHECK_INTERVAL_SEC"), fallback=600, minimum=30
         )
-        default_economy_interval = _bounded_int(
-            os.getenv("ECONOMY_CHECK_INTERVAL_SEC"), fallback=43200, minimum=300
-        )
 
         return cls(
             discord_token=token,
             data_path=data_path,
             economy_page_url=economy_page_url or NDC_ECONOMY_PAGE_URL,
             economy_zip_url=economy_zip_url,
-            guild_id=guild_id,
             poll_tick_sec=poll_tick,
             manual_check_timeout_sec=manual_timeout,
             default_stock_interval_sec=default_stock_interval,
-            default_economy_interval_sec=default_economy_interval,
         )
 
 
@@ -191,22 +181,6 @@ def economy_color_range(score: int) -> tuple[str, str]:
     if score <= 37:
         return ("黃紅燈", "32-37")
     return ("紅燈", "38-45")
-
-
-def normalize_signal_color_text(signal_text: str | None) -> str | None:
-    if not signal_text:
-        return None
-    text = signal_text.strip()
-    mapping = {
-        "藍": "藍燈",
-        "黃藍": "黃藍燈",
-        "綠": "綠燈",
-        "黃紅": "黃紅燈",
-        "紅": "紅燈",
-    }
-    if text in mapping:
-        return mapping[text]
-    return text
 
 
 def normalize_json_key(value: Any) -> str:
@@ -512,6 +486,20 @@ def format_stock_rule_line(index: int, rule: StockRule) -> str:
     return f"{index}. {rule.symbol} ({name}) | {condition_text}"
 
 
+def parse_stock_rules(rows: Any) -> list[StockRule]:
+    if not isinstance(rows, list):
+        return []
+    rules: list[StockRule] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            rules.append(StockRule.from_dict(row))
+        except ValueError:
+            continue
+    return rules
+
+
 class StockWarningBot(commands.Bot):
     def __init__(self, settings: Settings):
         super().__init__(command_prefix="!", intents=discord.Intents.default())
@@ -519,7 +507,6 @@ class StockWarningBot(commands.Bot):
         self.store = UserDataStore(settings)
         self.session: aiohttp.ClientSession | None = None
         self.background_tasks: list[asyncio.Task[Any]] = []
-        self._guild_sync_done = False
         self._economy_cache: dict[str, Any] = {"ts": 0.0, "data": None}
 
     async def setup_hook(self) -> None:
@@ -527,17 +514,10 @@ class StockWarningBot(commands.Bot):
         self.background_tasks.append(asyncio.create_task(self._run_scheduler_loop()))
 
         try:
-            if self.settings.guild_id:
-                synced = await self.sync_commands_to_guild(self.settings.guild_id)
-                logging.info(
-                    "已同步 %s 個指令到 guild=%s", synced, self.settings.guild_id
-                )
-                self._guild_sync_done = True
-            else:
-                synced = await self.sync_global_commands()
-                logging.info("已同步 %s 個全域指令", synced)
+            synced = await self.sync_global_commands()
+            logging.info("已同步 %s 個全域指令", synced)
         except Exception:
-            logging.exception("setup_hook 指令同步失敗，稍後 on_ready 會再嘗試。")
+            logging.exception("setup_hook 指令同步失敗。")
 
     async def close(self) -> None:
         for task in self.background_tasks:
@@ -550,27 +530,9 @@ class StockWarningBot(commands.Bot):
 
     async def on_ready(self) -> None:
         logging.info("Bot 已上線：%s", self.user)
-        if self._guild_sync_done:
-            return
-        if not self.settings.guild_id and self.guilds:
-            synced_guilds = 0
-            for guild in self.guilds:
-                try:
-                    await self.sync_commands_to_guild(guild.id)
-                    synced_guilds += 1
-                except Exception:
-                    logging.exception("Guild 指令同步失敗: guild=%s", guild.id)
-            logging.info("on_ready 完成 guild 指令同步：%s/%s", synced_guilds, len(self.guilds))
-            self._guild_sync_done = True
 
     async def sync_global_commands(self) -> int:
         synced = await self.tree.sync()
-        return len(synced)
-
-    async def sync_commands_to_guild(self, guild_id: int) -> int:
-        guild = discord.Object(id=guild_id)
-        self.tree.copy_global_to(guild=guild)
-        synced = await self.tree.sync(guild=guild)
         return len(synced)
 
     async def _run_scheduler_loop(self) -> None:
@@ -591,11 +553,12 @@ class StockWarningBot(commands.Bot):
         now_ts = time.time()
         now_local = datetime.now(TAIPEI_TZ)
         due_schedule_key, due_schedule_time = latest_due_economy_schedule(now_local)
+        check_plan: list[dict[str, Any]] = []
+        all_due_stock_symbols: set[str] = set()
 
         for user_id in user_ids:
             user = await self.store.get_user(user_id)
             state = user["state"]
-
             due_stock = now_ts - float(state.get("last_stock_check_ts", 0.0)) >= float(
                 self.settings.default_stock_interval_sec
             )
@@ -604,12 +567,54 @@ class StockWarningBot(commands.Bot):
                 and str(state.get("last_economy_schedule_key", "") or "")
                 != due_schedule_key
             )
+
+            stock_rules: list[StockRule] = []
+            if due_stock:
+                stock_rules = parse_stock_rules(user.get("watchlist", []))
+                all_due_stock_symbols.update(rule.symbol for rule in stock_rules)
+
+            check_plan.append(
+                {
+                    "user_id": user_id,
+                    "user": user,
+                    "due_stock": due_stock,
+                    "due_economy": due_economy,
+                    "stock_rules": stock_rules,
+                }
+            )
+
+        shared_quotes: dict[str, dict[str, Any]] | None = None
+        skip_individual_stock_fetch = False
+        if all_due_stock_symbols and self.session:
+            try:
+                shared_quotes = await fetch_twse_quotes(
+                    self.session, sorted(all_due_stock_symbols)
+                )
+            except Exception:
+                logging.exception("批次股票報價抓取失敗")
+                # 批次失敗時避免每位使用者各自重試，降低網路與 CPU 消耗。
+                shared_quotes = {}
+                skip_individual_stock_fetch = True
+
+        for item in check_plan:
+            user_id = int(item["user_id"])
+            user = item["user"]
+            due_stock = bool(item["due_stock"])
+            due_economy = bool(item["due_economy"])
+            stock_rules = item["stock_rules"]
+
             stock_ok = False
             economy_ok = False
 
             if due_stock:
                 try:
-                    await self.check_stocks_for_user(user_id, user)
+                    await self.check_stocks_for_user(
+                        user_id,
+                        user,
+                        preloaded_rules=stock_rules,
+                        preloaded_quotes=shared_quotes,
+                        skip_fetch=skip_individual_stock_fetch,
+                    )
                     stock_ok = True
                 except Exception:
                     logging.exception("使用者 %s 股票檢查失敗", user_id)
@@ -648,24 +653,30 @@ class StockWarningBot(commands.Bot):
             target_user = await self.fetch_user(user_id)
         await target_user.send(message)
 
-    async def check_stocks_for_user(self, user_id: int, user_payload: dict[str, Any]) -> None:
+    async def check_stocks_for_user(
+        self,
+        user_id: int,
+        user_payload: dict[str, Any],
+        preloaded_rules: list[StockRule] | None = None,
+        preloaded_quotes: dict[str, dict[str, Any]] | None = None,
+        skip_fetch: bool = False,
+    ) -> None:
         if not self.session:
             return
 
-        rows = user_payload.get("watchlist", [])
-        rules: list[StockRule] = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            try:
-                rules.append(StockRule.from_dict(row))
-            except ValueError:
-                continue
+        rules = preloaded_rules if preloaded_rules is not None else parse_stock_rules(
+            user_payload.get("watchlist", [])
+        )
         if not rules:
             return
 
-        symbols = sorted({rule.symbol for rule in rules})
-        quotes = await fetch_twse_quotes(self.session, symbols)
+        if preloaded_quotes is not None:
+            quotes = preloaded_quotes
+        else:
+            if skip_fetch:
+                return
+            symbols = sorted({rule.symbol for rule in rules})
+            quotes = await fetch_twse_quotes(self.session, symbols)
         pending_alerts: list[str] = []
 
         def mutator(payload: dict[str, Any]) -> None:
@@ -785,7 +796,6 @@ class StockWarningBot(commands.Bot):
     def _parse_economy_record_from_dict(self, row: dict[str, Any]) -> dict[str, Any] | None:
         score: int | None = None
         period: tuple[int, str, str] | None = None
-        signal_text: str | None = None
 
         for key, value in row.items():
             if isinstance(value, (dict, list, tuple)):
@@ -819,16 +829,6 @@ class StockWarningBot(commands.Bot):
                     if parsed_period is not None:
                         period = parsed_period
 
-            if signal_text is None:
-                if (
-                    "signal" in key_norm
-                    or "light" in key_norm
-                    or "color" in key_norm
-                    or "燈號" in key_text
-                    or "信號" in key_text
-                ):
-                    signal_text = normalize_signal_color_text(_optional_str(value))
-
         if score is None or period is None:
             return None
 
@@ -838,7 +838,6 @@ class StockWarningBot(commands.Bot):
             "display": period[1],
             "raw_id": period[2],
             "score": score,
-            "signal_text": signal_text,
             "color_name": color_name,
             "score_range": score_range,
         }
@@ -930,21 +929,17 @@ class StockWarningBot(commands.Bot):
                     latest = records[0]
                     previous = records[1] if len(records) > 1 else None
 
-                    signal_text = latest.get("signal_text") or latest.get("color_name")
                     return {
                         "release_id": f"period:{latest['raw_id']}:score:{latest['score']}",
                         "display": latest["display"],
                         "date_raw": latest["raw_id"],
                         "score": latest["score"],
-                        "signal_text": signal_text,
                         "color_name": latest["color_name"],
                         "score_range": latest["score_range"],
                         "previous_display": previous["display"] if previous else None,
                         "previous_score": previous["score"] if previous else None,
                         "previous_color_name": previous["color_name"] if previous else None,
                         "previous_score_range": previous["score_range"] if previous else None,
-                        "source_api_url": source_api_url,
-                        "source_page_url": self.settings.economy_page_url,
                         "official_page_url": self.settings.economy_page_url,
                     }
                 except Exception as exc:
@@ -997,7 +992,7 @@ class StockWarningBot(commands.Bot):
                     if resp.status >= 400:
                         raise RuntimeError(f"ZIP 下載回應狀態碼 {resp.status}")
                     zip_bytes = await resp.read()
-                return self._parse_economy_zip_bytes(zip_bytes, zip_url)
+                return self._parse_economy_zip_bytes(zip_bytes)
             except Exception as exc:
                 errors.append(f"{zip_url[:120]}... -> {type(exc).__name__}: {exc}")
                 continue
@@ -1005,7 +1000,7 @@ class StockWarningBot(commands.Bot):
         summary = "；".join(errors[:3]) if errors else "無可用 ZIP 來源"
         raise RuntimeError(f"景氣資料抓取失敗：{summary}")
 
-    def _parse_economy_zip_bytes(self, zip_bytes: bytes, zip_url: str) -> dict[str, Any]:
+    def _parse_economy_zip_bytes(self, zip_bytes: bytes) -> dict[str, Any]:
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as archive:
             csv_name = None
             # ZIP 內常同時存在 schema-*.csv 與資料本體，優先拿真正資料檔。
@@ -1045,9 +1040,6 @@ class StockWarningBot(commands.Bot):
                     "display": period[1],
                     "raw_id": period[2],
                     "score": score,
-                    "signal_text": normalize_signal_color_text(
-                        _optional_str(row.get("景氣對策信號"))
-                    ),
                     "color_name": color_name,
                     "score_range": score_range,
                 }
@@ -1076,16 +1068,12 @@ class StockWarningBot(commands.Bot):
             "display": latest["display"],
             "date_raw": latest["raw_id"],
             "score": latest["score"],
-            "signal_text": latest["signal_text"],
             "color_name": latest["color_name"],
             "score_range": latest["score_range"],
             "previous_display": previous["display"] if previous else None,
             "previous_score": previous["score"] if previous else None,
             "previous_color_name": previous["color_name"] if previous else None,
             "previous_score_range": previous["score_range"] if previous else None,
-            "source_zip_url": zip_url,
-            "source_api_url": None,
-            "source_page_url": DATA_GOV_DATASET_URL,
             "official_page_url": self.settings.economy_page_url,
         }
 
@@ -1182,15 +1170,7 @@ def build_bot(settings: Settings) -> StockWarningBot:
 
     async def build_check_now_snapshot(user_id: int) -> str:
         payload = await bot.store.get_user(user_id)
-        rows = payload.get("watchlist", [])
-        rules: list[StockRule] = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            try:
-                rules.append(StockRule.from_dict(row))
-            except ValueError:
-                continue
+        rules = parse_stock_rules(payload.get("watchlist", []))
 
         lines: list[str] = ["追蹤清單與股價:"]
         quote_map: dict[str, dict[str, Any]] = {}
@@ -1253,15 +1233,7 @@ def build_bot(settings: Settings) -> StockWarningBot:
         if not await ensure_dm_interaction(interaction):
             return
         user = await bot.store.ensure_user(interaction.user.id)
-        rows = user.get("watchlist", [])
-        rules: list[StockRule] = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            try:
-                rules.append(StockRule.from_dict(row))
-            except ValueError:
-                continue
+        rules = parse_stock_rules(user.get("watchlist", []))
 
         if not rules:
             await interaction.response.send_message("你目前沒有追蹤股票。")
