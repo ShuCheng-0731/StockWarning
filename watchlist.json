@@ -1,7 +1,7 @@
 {
   "stocks": [
     {
-      "symbol": "2330.TW",
+      "symbol": "2330",
       "name": "TSMC",
       "up_pct": 3.0,
       "down_pct": 3.0,
@@ -9,8 +9,8 @@
       "target_low": 900
     },
     {
-      "symbol": "AAPL",
-      "name": "Apple",
+      "symbol": "0050",
+      "name": "元大台灣50",
       "up_pct": 2.0,
       "down_pct": 2.0,
       "target_high": null,

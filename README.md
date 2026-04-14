@@ -8,8 +8,8 @@
 
 ## 1. 功能
 
-- 股票漲跌幅/目標價示警（台股、美股可混用）
-- 景氣對策信號更新通知（預設來源：`https://index.ndc.gov.tw/n/zh_twr`）
+- 台股漲跌幅/目標價示警（僅台股，代號可直接輸入 `2330`、`0050`）
+- 景氣對策信號更新通知（含綜合分數 + 對應燈號顏色區間）
 - 每位使用者獨立保存：
   - 追蹤股票清單
   - 輪詢秒數
@@ -42,7 +42,6 @@ pip install -r requirements.txt
    - `MANUAL_CHECK_TIMEOUT_SEC`
    - `USER_DATA_PATH`（預設 `user_data.json`）
    - `ECONOMY_SOURCE_URL`
-   - `ECONOMY_API_URL`
 
 ## 4. 啟動
 
@@ -101,10 +100,21 @@ Bot 權限至少包含：
 
 ## 8. 景氣對策信號來源
 
-預設先查 API：
+景氣資料來源：
 
-- `https://index.ndc.gov.tw/n/json/lightscore`
+- 資料集頁面：`https://data.gov.tw/dataset/6099`
+- 官方頁面：`https://index.ndc.gov.tw/n/zh_twr`
 
-若 API 失敗，再備援抓頁面：
+通知內容包含：
 
-- `https://index.ndc.gov.tw/n/zh_twr`
+- 最新月份（例如 `2026-02`）
+- 景氣對策信號綜合分數（例如 `40`）
+- 燈號對應區間（例如 `38-45（紅燈）`）
+
+## 9. 股價來源（台股）
+
+使用 TWSE 即時報價 API：
+
+- `https://mis.twse.com.tw/stock/api/getStockInfo.jsp`
+
+支援上市/上櫃自動判斷，代號輸入可省略 `.TW`，例如輸入 `2330` 即可。

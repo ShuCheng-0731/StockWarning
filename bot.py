@@ -1,16 +1,18 @@
 import asyncio
+import csv
 import copy
+import io
 import json
 import logging
 import os
 import re
 import time
+import zipfile
 from dataclasses import dataclass
 from html import unescape
 from pathlib import Path
 from time import monotonic
 from typing import Any, Callable
-from urllib.parse import urljoin
 
 import aiohttp
 import discord
@@ -19,26 +21,18 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 
-YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
+TWSE_QUOTE_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
+DATA_GOV_DATASET_URL = "https://data.gov.tw/dataset/6099"
 NDC_ECONOMY_PAGE_URL = "https://index.ndc.gov.tw/n/zh_twr"
-NDC_ECONOMY_API_URL = "https://index.ndc.gov.tw/n/json/lightscore"
-
-DOWNLOAD_LINK_PATTERN = re.compile(
-    r'href="([^"]*Download\.ashx[^"]+)"[^>]*>\s*(zip|xlsx|pdf|ods)\s*<',
+NDC_ECONOMY_ZIP_URL_PATTERN = re.compile(
+    r"https://ws\.ndc\.gov\.tw/Download\.ashx\?[^\"']*icon=\.zip[^\"']*",
     flags=re.IGNORECASE,
 )
-ROC_DATE_PATTERN = re.compile(r"發布日期：\s*(\d{2,3}-\d{2}-\d{2})")
-AD_DATE_PATTERN = re.compile(r"(20\d{2})[/-](\d{1,2})[/-](\d{1,2})")
-PERIOD_PATTERNS: list[tuple[re.Pattern[str], bool]] = [
-    (re.compile(r"\b(20\d{2})[./-]?M?([01]?\d)\b", flags=re.IGNORECASE), False),
-    (re.compile(r"\b(1\d{2})[./-]?M?([01]?\d)\b", flags=re.IGNORECASE), True),
-    (re.compile(r"\b(20\d{2})([01]\d)\b"), False),
-    (re.compile(r"\b(1\d{2})([01]\d)\b"), True),
-]
+TW_STOCK_CODE_PATTERN = re.compile(r"^\d{4,6}$")
 
-DEFAULT_WATCHLIST = [
+DEFAULT_WATCHLIST: list[dict[str, Any]] = [
     {
-        "symbol": "2330.TW",
+        "symbol": "2330",
         "name": "TSMC",
         "up_pct": 3.0,
         "down_pct": 3.0,
@@ -46,8 +40,8 @@ DEFAULT_WATCHLIST = [
         "target_low": None,
     },
     {
-        "symbol": "AAPL",
-        "name": "Apple",
+        "symbol": "0050",
+        "name": "元大台灣50",
         "up_pct": 2.0,
         "down_pct": 2.0,
         "target_high": None,
@@ -61,7 +55,6 @@ class Settings:
     discord_token: str
     data_path: Path
     economy_page_url: str
-    economy_api_url: str
     guild_id: int | None
     poll_tick_sec: int
     manual_check_timeout_sec: int
@@ -80,7 +73,6 @@ class Settings:
 
         data_path = Path(os.getenv("USER_DATA_PATH", "user_data.json")).resolve()
         economy_page_url = os.getenv("ECONOMY_SOURCE_URL", NDC_ECONOMY_PAGE_URL).strip()
-        economy_api_url = os.getenv("ECONOMY_API_URL", NDC_ECONOMY_API_URL).strip()
 
         poll_tick = _bounded_int(os.getenv("POLL_TICK_SEC"), fallback=30, minimum=10)
         manual_timeout = _bounded_int(
@@ -97,7 +89,6 @@ class Settings:
             discord_token=token,
             data_path=data_path,
             economy_page_url=economy_page_url or NDC_ECONOMY_PAGE_URL,
-            economy_api_url=economy_api_url or NDC_ECONOMY_API_URL,
             guild_id=guild_id,
             poll_tick_sec=poll_tick,
             manual_check_timeout_sec=manual_timeout,
@@ -118,8 +109,8 @@ class StockRule:
     @classmethod
     def from_dict(cls, row: dict[str, Any]) -> "StockRule":
         symbol = normalize_stock_symbol(row.get("symbol"))
-        if not symbol:
-            raise ValueError("股票缺少 symbol")
+        if not symbol or not is_tw_stock_symbol(symbol):
+            raise ValueError("僅支援台股代號 symbol")
         return cls(
             symbol=symbol,
             name=_optional_str(row.get("name")),
@@ -141,7 +132,68 @@ class StockRule:
 
 
 def normalize_stock_symbol(value: Any) -> str:
-    return str(value or "").strip().upper()
+    symbol = str(value or "").strip().upper().replace(" ", "")
+    if symbol.endswith(".TW"):
+        symbol = symbol[:-3]
+    elif symbol.endswith(".TWO"):
+        symbol = symbol[:-4]
+    return symbol
+
+
+def is_tw_stock_symbol(symbol: str) -> bool:
+    return bool(TW_STOCK_CODE_PATTERN.fullmatch(symbol))
+
+
+def parse_float_str(value: Any) -> float | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text in {"-", "--", "X", "x", "null", "None"}:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def parse_int_str(value: Any) -> int | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text in {"-", "--", "X", "x", "null", "None"}:
+        return None
+    try:
+        return int(float(text))
+    except ValueError:
+        return None
+
+
+def economy_color_range(score: int) -> tuple[str, str]:
+    if score <= 16:
+        return ("藍燈", "9-16")
+    if score <= 22:
+        return ("黃藍燈", "17-22")
+    if score <= 31:
+        return ("綠燈", "23-31")
+    if score <= 37:
+        return ("黃紅燈", "32-37")
+    return ("紅燈", "38-45")
+
+
+def normalize_signal_color_text(signal_text: str | None) -> str | None:
+    if not signal_text:
+        return None
+    text = signal_text.strip()
+    mapping = {
+        "藍": "藍燈",
+        "黃藍": "黃藍燈",
+        "綠": "綠燈",
+        "黃紅": "黃紅燈",
+        "紅": "紅燈",
+    }
+    if text in mapping:
+        return mapping[text]
+    return text
 
 
 def _optional_float(value: Any) -> float | None:
@@ -230,7 +282,7 @@ class UserDataStore:
             if not isinstance(row, dict):
                 continue
             symbol = normalize_stock_symbol(row.get("symbol"))
-            if not symbol:
+            if not symbol or not is_tw_stock_symbol(symbol):
                 continue
             normalized_watchlist.append(
                 {
@@ -322,84 +374,52 @@ class UserDataStore:
             return copy.deepcopy(self.data["users"][key])
 
 
-def roc_to_iso(roc_date: str) -> str:
-    year, month, day = roc_date.split("-")
-    ad_year = int(year) + 1911
-    return f"{ad_year:04d}-{month}-{day}"
-
-
-def parse_economy_release_page(html: str, base_url: str) -> dict[str, Any]:
-    match = ROC_DATE_PATTERN.search(html)
-    roc_date = match.group(1) if match else None
-    iso_date = roc_to_iso(roc_date) if roc_date else None
-
-    if not iso_date:
-        ad_match = AD_DATE_PATTERN.search(html)
-        if ad_match:
-            iso_date = (
-                f"{int(ad_match.group(1)):04d}-"
-                f"{int(ad_match.group(2)):02d}-"
-                f"{int(ad_match.group(3)):02d}"
-            )
-
-    links: dict[str, str] = {}
-    for href, ext in DOWNLOAD_LINK_PATTERN.findall(html):
-        full = urljoin(base_url, unescape(href))
-        key = ext.lower()
-        if key not in links:
-            links[key] = full
-
-    return {"roc_date": roc_date, "iso_date": iso_date, "links": links}
-
-
-def extract_latest_period(payload: Any) -> str | None:
-    candidates: set[tuple[int, int]] = set()
-    stack: list[Any] = [payload]
-
-    while stack:
-        node = stack.pop()
-        if isinstance(node, dict):
-            stack.extend(node.values())
-        elif isinstance(node, list):
-            stack.extend(node)
-        elif isinstance(node, (str, int, float)):
-            text = str(node)
-            for pattern, is_roc_year in PERIOD_PATTERNS:
-                for match in pattern.finditer(text):
-                    year = int(match.group(1))
-                    month = int(match.group(2))
-                    if not (1 <= month <= 12):
-                        continue
-                    if is_roc_year:
-                        year += 1911
-                    if 1990 <= year <= 2100:
-                        candidates.add((year, month))
-
-    if not candidates:
-        return None
-
-    year, month = max(candidates)
-    return f"{year:04d}-{month:02d}"
-
-
-async def fetch_quotes(
+async def fetch_twse_quotes(
     session: aiohttp.ClientSession, symbols: list[str]
 ) -> dict[str, dict[str, Any]]:
-    if not symbols:
+    tw_symbols = [symbol for symbol in symbols if is_tw_stock_symbol(symbol)]
+    if not tw_symbols:
         return {}
 
-    headers = {"User-Agent": "Mozilla/5.0 StockWarningBot/1.0"}
-    params = {"symbols": ",".join(symbols)}
-    async with session.get(YAHOO_QUOTE_URL, params=params, headers=headers) as resp:
-        resp.raise_for_status()
-        payload = await resp.json()
+    ex_channels: list[str] = []
+    for symbol in tw_symbols:
+        ex_channels.append(f"tse_{symbol}.tw")
+        ex_channels.append(f"otc_{symbol}.tw")
 
-    results = payload.get("quoteResponse", {}).get("result", [])
+    headers = {"User-Agent": "Mozilla/5.0 StockWarningBot/1.0", "Referer": "https://mis.twse.com.tw/"}
+    params = {"ex_ch": "|".join(ex_channels), "json": "1", "delay": "0"}
+    async with session.get(TWSE_QUOTE_URL, params=params, headers=headers) as resp:
+        resp.raise_for_status()
+        payload = await resp.json(content_type=None)
+
+    results = payload.get("msgArray", [])
     output: dict[str, dict[str, Any]] = {}
     for row in results:
-        symbol = str(row.get("symbol", "")).upper()
-        if symbol:
-            output[symbol] = row
+        if not isinstance(row, dict):
+            continue
+        symbol = normalize_stock_symbol(row.get("c"))
+        if not symbol or not is_tw_stock_symbol(symbol):
+            continue
+        if symbol not in tw_symbols:
+            continue
+
+        latest = parse_float_str(row.get("z"))
+        prev_close = parse_float_str(row.get("y"))
+        # 無成交時 z 可能為 "-"，改用開盤價補
+        if latest is None:
+            latest = parse_float_str(row.get("o"))
+
+        if latest is None or prev_close in (None, 0):
+            continue
+
+        output[symbol] = {
+            "symbol": symbol,
+            "name": _optional_str(row.get("n")) or _optional_str(row.get("nf")) or symbol,
+            "price": latest,
+            "prev_close": prev_close,
+            "market": _optional_str(row.get("ex")) or "tse",
+        }
+
     return output
 
 
@@ -551,7 +571,7 @@ class StockWarningBot(commands.Bot):
             return
 
         symbols = sorted({rule.symbol for rule in rules})
-        quotes = await fetch_quotes(self.session, symbols)
+        quotes = await fetch_twse_quotes(self.session, symbols)
         pending_alerts: list[str] = []
 
         def mutator(payload: dict[str, Any]) -> None:
@@ -561,15 +581,13 @@ class StockWarningBot(commands.Bot):
                 if not quote:
                     continue
 
-                price = _optional_float(quote.get("regularMarketPrice"))
-                prev_close = _optional_float(quote.get("regularMarketPreviousClose"))
+                price = parse_float_str(quote.get("price"))
+                prev_close = parse_float_str(quote.get("prev_close"))
                 if price is None or prev_close in (None, 0):
                     continue
 
                 change_pct = ((price - prev_close) / prev_close) * 100
-                display_name = rule.name or str(
-                    quote.get("shortName") or quote.get("longName") or rule.symbol
-                )
+                display_name = rule.name or str(quote.get("name") or rule.symbol)
 
                 checks: list[tuple[str, bool, str]] = []
                 if rule.up_pct is not None:
@@ -631,64 +649,97 @@ class StockWarningBot(commands.Bot):
         now_ts = time.time()
         cached = self._economy_cache.get("data")
         cached_ts = float(self._economy_cache.get("ts", 0.0) or 0.0)
-        if cached and (now_ts - cached_ts) < 60:
+        if cached and (now_ts - cached_ts) < 300:
             return cached
 
         release_data: dict[str, Any] | None = None
         try:
-            release_data = await self._fetch_economy_release_from_api()
+            release_data = await self._fetch_economy_release_from_zip()
         except Exception:
-            logging.exception("景氣對策信號 API 檢查失敗，改用網頁備援。")
+            logging.exception("景氣對策信號 ZIP 來源檢查失敗。")
 
         if release_data is None:
-            try:
-                release_data = await self._fetch_economy_release_from_page()
-            except Exception:
-                logging.exception("景氣對策信號網頁備援檢查也失敗。")
-                return None
+            return None
 
         if release_data:
             self._economy_cache = {"ts": now_ts, "data": release_data}
         return release_data
 
-    async def _fetch_economy_release_from_api(self) -> dict[str, Any] | None:
+    async def _fetch_economy_release_from_zip(self) -> dict[str, Any] | None:
         if not self.session:
             return None
-        headers = {
-            "User-Agent": "Mozilla/5.0 StockWarningBot/1.0",
-            "Accept": "application/json,text/plain,*/*",
-        }
-        async with self.session.post(
-            self.settings.economy_api_url, headers=headers, data={}
-        ) as resp:
-            if resp.status >= 400:
-                raise RuntimeError(f"API 回應狀態碼 {resp.status}")
-            payload = await resp.json(content_type=None)
 
-        latest_period = extract_latest_period(payload)
-        if not latest_period:
-            raise RuntimeError("無法從景氣對策信號 API 解析最新月份")
-
-        return {"release_id": f"period:{latest_period}", "display": latest_period}
-
-    async def _fetch_economy_release_from_page(self) -> dict[str, Any] | None:
-        if not self.session:
-            return None
         headers = {"User-Agent": "Mozilla/5.0 StockWarningBot/1.0"}
-        async with self.session.get(self.settings.economy_page_url, headers=headers) as resp:
+        async with self.session.get(DATA_GOV_DATASET_URL, headers=headers) as resp:
             if resp.status >= 400:
-                raise RuntimeError(f"網頁回應狀態碼 {resp.status}")
+                raise RuntimeError(f"data.gov.tw 回應狀態碼 {resp.status}")
             html = await resp.text(errors="ignore")
 
-        page_data = parse_economy_release_page(html, self.settings.economy_page_url)
-        if page_data.get("iso_date"):
-            return {
-                "release_id": f"date:{page_data['iso_date']}",
-                "display": page_data["iso_date"],
-                "roc_date": page_data.get("roc_date"),
-                "links": page_data.get("links", {}),
-            }
-        return None
+        url_match = NDC_ECONOMY_ZIP_URL_PATTERN.search(html)
+        if not url_match:
+            raise RuntimeError("找不到景氣指標 ZIP 下載連結")
+        zip_url = unescape(url_match.group(0))
+
+        async with self.session.get(zip_url, headers=headers) as resp:
+            if resp.status >= 400:
+                raise RuntimeError(f"ZIP 下載回應狀態碼 {resp.status}")
+            zip_bytes = await resp.read()
+
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as archive:
+            csv_name = None
+            for name in archive.namelist():
+                if name.endswith("景氣指標與燈號.csv"):
+                    csv_name = name
+                    break
+            if not csv_name:
+                raise RuntimeError("ZIP 中找不到景氣指標與燈號.csv")
+
+            csv_text = archive.read(csv_name).decode("utf-8-sig", errors="ignore")
+
+        reader = csv.DictReader(io.StringIO(csv_text))
+        latest_row: dict[str, str] | None = None
+        latest_date_value = -1
+        for row in reader:
+            if not isinstance(row, dict):
+                continue
+            date_raw = str(row.get("Date", "")).strip()
+            if not date_raw.isdigit():
+                continue
+            date_value = int(date_raw)
+            if date_value > latest_date_value:
+                latest_date_value = date_value
+                latest_row = row
+
+        if not latest_row:
+            raise RuntimeError("無法從 CSV 解析最新景氣資料")
+
+        date_raw = str(latest_row.get("Date", "")).strip()
+        if len(date_raw) == 6:
+            display = f"{date_raw[:4]}-{date_raw[4:6]}"
+        else:
+            display = date_raw
+
+        score = parse_int_str(latest_row.get("景氣對策信號綜合分數"))
+        if score is None:
+            raise RuntimeError("無法解析景氣對策信號綜合分數")
+
+        signal_text = normalize_signal_color_text(
+            _optional_str(latest_row.get("景氣對策信號"))
+        )
+        color_name, score_range = economy_color_range(score)
+
+        return {
+            "release_id": f"period:{date_raw}:score:{score}",
+            "display": display,
+            "date_raw": date_raw,
+            "score": score,
+            "signal_text": signal_text,
+            "color_name": color_name,
+            "score_range": score_range,
+            "source_zip_url": zip_url,
+            "source_page_url": DATA_GOV_DATASET_URL,
+            "official_page_url": self.settings.economy_page_url,
+        }
 
     async def check_economy_for_user(
         self, user_id: int, user_payload: dict[str, Any]
@@ -719,16 +770,17 @@ class StockWarningBot(commands.Bot):
 
         lines = [
             "[景氣對策信號更新通知]",
-            f"最新月份/日期: {release_data.get('display')}",
-            f"來源頁面: {self.settings.economy_page_url}",
+            f"最新月份: {release_data.get('display')}",
+            f"景氣對策信號綜合分數: {release_data.get('score')} 分",
+            f"燈號區間: {release_data.get('score_range')}（{release_data.get('color_name')}）",
         ]
-        if release_data.get("roc_date"):
-            lines.append(f"民國發布日期: {release_data['roc_date']}")
-        links = release_data.get("links", {})
-        if links.get("xlsx"):
-            lines.append(f"xlsx: {links['xlsx']}")
-        if links.get("zip"):
-            lines.append(f"zip: {links['zip']}")
+        if release_data.get("signal_text"):
+            lines.append(f"官方燈號文字: {release_data['signal_text']}")
+        if release_data.get("official_page_url"):
+            lines.append(f"官方頁面: {release_data.get('official_page_url')}")
+        lines.append(f"資料頁: {release_data.get('source_page_url')}")
+        if release_data.get("source_zip_url"):
+            lines.append(f"原始資料 ZIP: {release_data['source_zip_url']}")
 
         try:
             await self.send_alert_to_user(user_id, "\n".join(lines))
@@ -910,6 +962,11 @@ def build_bot(settings: Settings) -> StockWarningBot:
         if not symbol:
             await interaction.response.send_message("`symbol` 不能是空值。")
             return
+        if not is_tw_stock_symbol(symbol):
+            await interaction.response.send_message(
+                "目前僅支援台股代號（4~6碼），例如 `2330`、`0050`。"
+            )
+            return
         if up_pct is not None and up_pct < 0:
             await interaction.response.send_message("`up_pct` 請填正數或 0。")
             return
@@ -972,6 +1029,11 @@ def build_bot(settings: Settings) -> StockWarningBot:
         symbol = normalize_stock_symbol(symbol)
         if not symbol:
             await interaction.response.send_message("`symbol` 不能是空值。")
+            return
+        if not is_tw_stock_symbol(symbol):
+            await interaction.response.send_message(
+                "目前僅支援台股代號（4~6碼），例如 `2330`、`0050`。"
+            )
             return
         if up_pct is not None and up_pct < 0:
             await interaction.response.send_message("`up_pct` 請填正數或 0。")
@@ -1037,6 +1099,11 @@ def build_bot(settings: Settings) -> StockWarningBot:
         symbol = normalize_stock_symbol(symbol)
         if not symbol:
             await interaction.response.send_message("`symbol` 不能是空值。")
+            return
+        if not is_tw_stock_symbol(symbol):
+            await interaction.response.send_message(
+                "目前僅支援台股代號（4~6碼），例如 `2330`、`0050`。"
+            )
             return
 
         removed = False
