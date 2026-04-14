@@ -81,8 +81,16 @@ python bot.py
 - `/watchlist_add`：新增追蹤股票
 - `/watchlist_update`：更新追蹤條件
 - `/watchlist_remove`：移除追蹤股票
+- `/sync_commands`：手動重新同步 Slash 指令（指令更新後可立即生效）
 
-## 7. watchlist 規格
+## 7. 指令沒更新時怎麼辦
+
+1. 在 `.env` 設定 `DISCORD_GUILD_ID` 為你的伺服器 ID（建議）
+2. 重啟 bot（Railway 重新部署）
+3. 在伺服器內執行 `/sync_commands`
+4. 如果仍看不到新指令，確認 bot 邀請 scope 包含 `applications.commands`
+
+## 8. watchlist 規格
 
 每一檔股票欄位：
 
@@ -95,13 +103,13 @@ python bot.py
 
 示例：`watchlist.example.json`
 
-## 8. 通知去重邏輯
+## 9. 通知去重邏輯
 
 - 同一條件首次達標才通知一次
 - 回落到未達標後，再次達標才會再通知
 - 相關狀態保存在 `state.json`
 
-## 9. 景氣對策信號來源
+## 10. 景氣對策信號來源
 
 預設先查 API：
 

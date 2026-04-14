@@ -371,6 +371,7 @@ class StockWarningBot(commands.Bot):
         )
         self.runtime_config = load_runtime_config(settings)
         self.background_tasks: list[asyncio.Task[Any]] = []
+        self._guild_sync_done = False
 
     async def setup_hook(self) -> None:
         timeout = aiohttp.ClientTimeout(total=20)
@@ -394,12 +395,19 @@ class StockWarningBot(commands.Bot):
             )
         )
 
-        if self.settings.guild_id:
-            guild = discord.Object(id=self.settings.guild_id)
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
-        else:
-            await self.tree.sync()
+        try:
+            if self.settings.guild_id:
+                synced = await self.sync_commands_to_guild(self.settings.guild_id)
+                logging.info(
+                    "已同步 %s 個指令到 guild=%s", synced, self.settings.guild_id
+                )
+                self._guild_sync_done = True
+            else:
+                synced = await self.sync_global_commands()
+                logging.info("已同步 %s 個全域指令", synced)
+        except Exception:
+            # 指令同步失敗不應影響 bot 啟動，避免整個服務中斷。
+            logging.exception("setup_hook 指令同步失敗，稍後 on_ready 會再嘗試。")
 
     async def close(self) -> None:
         for task in self.background_tasks:
@@ -412,6 +420,31 @@ class StockWarningBot(commands.Bot):
 
     async def on_ready(self) -> None:
         logging.info("Bot 已上線：%s", self.user)
+        if self._guild_sync_done:
+            return
+
+        # 沒有設定 DISCORD_GUILD_ID 時，嘗試把指令同步到目前加入的伺服器，
+        # 讓更新可以立即生效，不用等全域同步延遲。
+        if not self.settings.guild_id and self.guilds:
+            synced_guilds = 0
+            for guild in self.guilds:
+                try:
+                    await self.sync_commands_to_guild(guild.id)
+                    synced_guilds += 1
+                except Exception:
+                    logging.exception("Guild 指令同步失敗: guild=%s", guild.id)
+            logging.info("on_ready 完成 guild 指令同步：%s/%s", synced_guilds, len(self.guilds))
+            self._guild_sync_done = True
+
+    async def sync_global_commands(self) -> int:
+        synced = await self.tree.sync()
+        return len(synced)
+
+    async def sync_commands_to_guild(self, guild_id: int) -> int:
+        guild = discord.Object(id=guild_id)
+        self.tree.copy_global_to(guild=guild)
+        synced = await self.tree.sync(guild=guild)
+        return len(synced)
 
     def get_notification_channel_id(self) -> int | None:
         return _optional_int(self.runtime_config.get("notification_channel_id"))
@@ -729,6 +762,26 @@ def build_bot(settings: Settings) -> StockWarningBot:
             ephemeral=True,
         )
 
+    @bot.tree.command(name="sync_commands", description="手動重新同步 Slash 指令")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def sync_commands(interaction: discord.Interaction) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "請在伺服器頻道內使用這個指令。", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            synced = await bot.sync_commands_to_guild(interaction.guild_id)
+            await interaction.followup.send(
+                f"已重新同步 {synced} 個指令到目前伺服器。", ephemeral=True
+            )
+        except Exception as exc:
+            logging.exception("手動同步指令失敗")
+            await interaction.followup.send(
+                f"同步失敗：{type(exc).__name__}: {exc}", ephemeral=True
+            )
+
     @bot.tree.command(name="settings_set_channel", description="設定通知頻道")
     @app_commands.checks.has_permissions(manage_guild=True)
     async def settings_set_channel(
@@ -975,6 +1028,8 @@ def build_bot(settings: Settings) -> StockWarningBot:
 
         if isinstance(error, app_commands.MissingPermissions):
             message = "你需要 `管理伺服器` 權限才能使用這個指令。"
+        elif isinstance(error, app_commands.CheckFailure):
+            message = "你目前沒有權限使用這個指令。"
         else:
             message = f"指令執行失敗：{type(error).__name__}"
 
