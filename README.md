@@ -8,13 +8,11 @@
 - `/status`：查看你的監控狀態
 - `/settings_show`：查看你的個人設定
 - `/settings_set_interval`：設定你的輪詢秒數
-- `/settings_set_channel`：舊版相容提示（DM 模式不需設定頻道）
-- `/settings_enable`：啟用/停用你的排程
 - `/watchlist_show`：查看你的追蹤清單
 - `/watchlist_add`：新增追蹤股票
 - `/watchlist_update`：更新追蹤條件
 - `/watchlist_remove`：移除追蹤股票
-- `/check_now`：立即手動檢查一次
+- `/check_now`：立即手動檢查，顯示追蹤清單、股價、景氣燈號（分數與顏色區間）
 - `/sync_commands`：手動同步全域指令
 
 注意：若在伺服器頻道使用，Bot 會提示你改到私訊使用。

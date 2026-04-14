@@ -237,7 +237,6 @@ def default_user_payload(settings: Settings) -> dict[str, Any]:
     return {
         "watchlist": copy.deepcopy(DEFAULT_WATCHLIST),
         "config": {
-            "enabled": True,
             "stock_interval_sec": settings.default_stock_interval_sec,
             "economy_interval_sec": settings.default_economy_interval_sec,
         },
@@ -303,7 +302,6 @@ class UserDataStore:
         if not isinstance(config, dict):
             config = {}
         payload["config"] = {
-            "enabled": bool(config.get("enabled", True)),
             "stock_interval_sec": _bounded_int(
                 config.get("stock_interval_sec"),
                 fallback=self.settings.default_stock_interval_sec,
@@ -536,8 +534,6 @@ class StockWarningBot(commands.Bot):
             user = await self.store.get_user(user_id)
             config = user["config"]
             state = user["state"]
-            if not config.get("enabled", True):
-                continue
 
             due_stock = now_ts - float(state.get("last_stock_check_ts", 0.0)) >= float(
                 config.get("stock_interval_sec", self.settings.default_stock_interval_sec)
@@ -852,6 +848,65 @@ def build_bot(settings: Settings) -> StockWarningBot:
             logging.exception("手動檢查失敗: %s", label)
             return f"- {label}: 失敗（{type(exc).__name__}: {exc}）"
 
+    async def build_check_now_snapshot(user_id: int) -> str:
+        payload = await bot.store.get_user(user_id)
+        rows = payload.get("watchlist", [])
+        rules: list[StockRule] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                rules.append(StockRule.from_dict(row))
+            except ValueError:
+                continue
+
+        lines: list[str] = ["追蹤清單與股價:"]
+        quote_map: dict[str, dict[str, Any]] = {}
+        if bot.session and rules:
+            symbols = sorted({rule.symbol for rule in rules})
+            try:
+                quote_map = await fetch_twse_quotes(bot.session, symbols)
+            except Exception as exc:
+                lines.append(f"- 股價資料取得失敗: {type(exc).__name__}")
+
+        if not rules:
+            lines.append("- 目前沒有追蹤股票")
+        else:
+            for rule in rules:
+                quote = quote_map.get(rule.symbol)
+                display_name = rule.name or (str(quote.get("name")) if quote else rule.symbol)
+                if not quote:
+                    lines.append(f"- {rule.symbol} ({display_name}): 無法取得報價")
+                    continue
+                price = parse_float_str(quote.get("price"))
+                prev_close = parse_float_str(quote.get("prev_close"))
+                if price is None:
+                    lines.append(f"- {rule.symbol} ({display_name}): 無法取得報價")
+                    continue
+                if prev_close in (None, 0):
+                    lines.append(f"- {rule.symbol} ({display_name}): {price:.2f}")
+                    continue
+                change_pct = ((price - prev_close) / prev_close) * 100
+                lines.append(
+                    f"- {rule.symbol} ({display_name}): {price:.2f} ({change_pct:+.2f}%)"
+                )
+
+        release_data = await bot.get_latest_economy_release()
+        lines.append("")
+        lines.append("景氣燈號:")
+        if not release_data:
+            lines.append("- 無法取得景氣資料")
+            return "\n".join(lines)
+
+        lines.append(f"- 最新月份: {release_data.get('display')}")
+        lines.append(
+            f"- 燈號: {release_data.get('score')} 分，"
+            f"{release_data.get('score_range')}（{release_data.get('color_name')}）"
+        )
+        if release_data.get("signal_text"):
+            lines.append(f"- 官方燈號文字: {release_data.get('signal_text')}")
+        return "\n".join(lines)
+
     @bot.tree.command(name="status", description="查看你的監控狀態（私訊模式）")
     async def status(interaction: discord.Interaction) -> None:
         if not await ensure_dm_interaction(interaction):
@@ -863,7 +918,6 @@ def build_bot(settings: Settings) -> StockWarningBot:
             f"- 追蹤股票數: {len(user['watchlist'])}",
             f"- 股票輪詢秒數: {config['stock_interval_sec']}",
             f"- 景氣輪詢秒數: {config['economy_interval_sec']}",
-            f"- 啟用通知: {'是' if config.get('enabled', True) else '否'}",
         ]
         await interaction.response.send_message("\n".join(lines))
 
@@ -879,7 +933,6 @@ def build_bot(settings: Settings) -> StockWarningBot:
                     "你的個人設定:",
                     f"- 股票輪詢秒數: {config['stock_interval_sec']}",
                     f"- 景氣輪詢秒數: {config['economy_interval_sec']}",
-                    f"- 啟用通知: {'是' if config.get('enabled', True) else '否'}",
                 ]
             )
         )
@@ -920,28 +973,6 @@ def build_bot(settings: Settings) -> StockWarningBot:
                     f"- 景氣輪詢秒數: {config['economy_interval_sec']}",
                 ]
             )
-        )
-
-    @bot.tree.command(
-        name="settings_set_channel",
-        description="舊版相容：DM 模式固定通知到你的私訊",
-    )
-    async def settings_set_channel_compat(interaction: discord.Interaction) -> None:
-        if not await ensure_dm_interaction(interaction):
-            return
-        await interaction.response.send_message(
-            "目前是 DM 模式，不需要設定頻道。通知會直接發到你的私訊。"
-        )
-
-    @bot.tree.command(name="settings_enable", description="開啟或關閉你的通知排程")
-    async def settings_enable(interaction: discord.Interaction, enabled: bool) -> None:
-        if not await ensure_dm_interaction(interaction):
-            return
-        await bot.store.update_user(
-            interaction.user.id, lambda payload: payload["config"].update({"enabled": enabled})
-        )
-        await interaction.response.send_message(
-            f"已將你的通知排程設定為：{'啟用' if enabled else '停用'}。"
         )
 
     @bot.tree.command(name="watchlist_show", description="查看你的追蹤股票清單")
@@ -1175,7 +1206,10 @@ def build_bot(settings: Settings) -> StockWarningBot:
                 lambda: bot.check_economy_for_user(interaction.user.id, user_payload),
             ),
         )
-        await interaction.followup.send("\n".join(["已完成一次手動檢查。", *results]))
+        snapshot = await build_check_now_snapshot(interaction.user.id)
+        await interaction.followup.send(
+            "\n".join(["已完成一次手動檢查。", *results, "", snapshot])
+        )
 
     @bot.tree.command(name="sync_commands", description="手動同步 slash 指令（私訊可用）")
     async def sync_commands(interaction: discord.Interaction) -> None:
