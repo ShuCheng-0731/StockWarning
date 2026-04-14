@@ -951,10 +951,18 @@ class StockWarningBot(commands.Bot):
     def _parse_economy_zip_bytes(self, zip_bytes: bytes, zip_url: str) -> dict[str, Any]:
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as archive:
             csv_name = None
+            # ZIP 內常同時存在 schema-*.csv 與資料本體，優先拿真正資料檔。
             for name in archive.namelist():
-                if name.endswith("景氣指標與燈號.csv"):
+                base = Path(name).name
+                if base == "景氣指標與燈號.csv":
                     csv_name = name
                     break
+            if not csv_name:
+                for name in archive.namelist():
+                    base = Path(name).name
+                    if base.endswith("景氣指標與燈號.csv") and not base.startswith("schema-"):
+                        csv_name = name
+                        break
             if not csv_name:
                 raise RuntimeError("ZIP 中找不到景氣指標與燈號.csv")
 
