@@ -1130,20 +1130,8 @@ class StockWarningBot(commands.Bot):
                 f"前一期分數: {release_data.get('previous_display')} "
                 f"{release_data.get('previous_score')} 分"
             )
-            if release_data.get("previous_score_range") and release_data.get(
-                "previous_color_name"
-            ):
-                lines.append(
-                    f"前一期燈號區間: {release_data.get('previous_score_range')}（{release_data.get('previous_color_name')}）"
-                )
         if release_data.get("official_page_url"):
             lines.append(f"官方頁面: {release_data.get('official_page_url')}")
-        if release_data.get("source_api_url"):
-            lines.append(f"資料 API: {release_data.get('source_api_url')}")
-        elif release_data.get("source_page_url"):
-            lines.append(f"資料頁: {release_data.get('source_page_url')}")
-        if release_data.get("source_zip_url"):
-            lines.append(f"原始資料 ZIP: {release_data['source_zip_url']}")
 
         try:
             await self.send_alert_to_user(user_id, "\n".join(lines))
