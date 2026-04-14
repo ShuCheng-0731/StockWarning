@@ -10,10 +10,12 @@ import ssl
 import time
 import zipfile
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from html import unescape
 from pathlib import Path
 from time import monotonic
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 import aiohttp
 import discord
@@ -36,6 +38,7 @@ NDC_ECONOMY_ZIP_URL_PATTERN = re.compile(
     flags=re.IGNORECASE,
 )
 TW_STOCK_CODE_PATTERN = re.compile(r"^\d{4,6}$")
+TAIPEI_TZ = ZoneInfo("Asia/Taipei") if ZoneInfo else timezone(timedelta(hours=8))
 
 DEFAULT_WATCHLIST: list[dict[str, Any]] = [
     {
@@ -250,6 +253,26 @@ def parse_year_month(value: Any) -> tuple[int, str, str] | None:
     return None
 
 
+def economy_schedule_datetime(year: int, month: int) -> datetime:
+    dt = datetime(year, month, 27, 20, 0, 0, tzinfo=TAIPEI_TZ)
+    while dt.weekday() >= 5:
+        dt += timedelta(days=1)
+    return dt
+
+
+def latest_due_economy_schedule(now: datetime) -> tuple[str, datetime]:
+    current = economy_schedule_datetime(now.year, now.month)
+    if now >= current:
+        return (f"{now.year:04d}-{now.month:02d}", current)
+
+    if now.month == 1:
+        prev_year, prev_month = now.year - 1, 12
+    else:
+        prev_year, prev_month = now.year, now.month - 1
+    prev = economy_schedule_datetime(prev_year, prev_month)
+    return (f"{prev_year:04d}-{prev_month:02d}", prev)
+
+
 def _optional_float(value: Any) -> float | None:
     if value is None or value == "":
         return None
@@ -294,6 +317,7 @@ def default_user_payload(settings: Settings) -> dict[str, Any]:
             "economy": {"last_release_id": None},
             "last_stock_check_ts": 0.0,
             "last_economy_check_ts": 0.0,
+            "last_economy_schedule_key": "",
         },
     }
 
@@ -362,6 +386,9 @@ class UserDataStore:
             "last_stock_check_ts": float(state.get("last_stock_check_ts", 0.0) or 0.0),
             "last_economy_check_ts": float(
                 state.get("last_economy_check_ts", 0.0) or 0.0
+            ),
+            "last_economy_schedule_key": str(
+                state.get("last_economy_schedule_key", "") or ""
             ),
         }
 
@@ -562,6 +589,8 @@ class StockWarningBot(commands.Bot):
         if not user_ids:
             return
         now_ts = time.time()
+        now_local = datetime.now(TAIPEI_TZ)
+        due_schedule_key, due_schedule_time = latest_due_economy_schedule(now_local)
 
         for user_id in user_ids:
             user = await self.store.get_user(user_id)
@@ -570,19 +599,26 @@ class StockWarningBot(commands.Bot):
             due_stock = now_ts - float(state.get("last_stock_check_ts", 0.0)) >= float(
                 self.settings.default_stock_interval_sec
             )
-            due_economy = now_ts - float(state.get("last_economy_check_ts", 0.0)) >= float(
-                self.settings.default_economy_interval_sec
+            due_economy = (
+                now_local >= due_schedule_time
+                and str(state.get("last_economy_schedule_key", "") or "")
+                != due_schedule_key
             )
+            stock_ok = False
+            economy_ok = False
 
             if due_stock:
                 try:
                     await self.check_stocks_for_user(user_id, user)
+                    stock_ok = True
                 except Exception:
                     logging.exception("使用者 %s 股票檢查失敗", user_id)
 
             if due_economy:
                 try:
-                    await self.check_economy_for_user(user_id, user)
+                    economy_ok = await self.check_economy_for_user(
+                        user_id, user, force_notify=True
+                    )
                 except Exception:
                     logging.exception("使用者 %s 景氣檢查失敗", user_id)
 
@@ -592,11 +628,16 @@ class StockWarningBot(commands.Bot):
                     lambda p: p["state"].update(
                         {
                             "last_stock_check_ts": now_ts
-                            if due_stock
+                            if stock_ok
                             else p["state"].get("last_stock_check_ts", 0.0),
                             "last_economy_check_ts": now_ts
-                            if due_economy
+                            if economy_ok
                             else p["state"].get("last_economy_check_ts", 0.0),
+                            "last_economy_schedule_key": due_schedule_key
+                            if economy_ok and due_economy
+                            else str(
+                                p["state"].get("last_economy_schedule_key", "") or ""
+                            ),
                         }
                     ),
                 )
@@ -802,9 +843,7 @@ class StockWarningBot(commands.Bot):
             "score_range": score_range,
         }
 
-    def _select_latest_economy_record_from_json(
-        self, payload: Any
-    ) -> dict[str, Any] | None:
+    def _select_latest_economy_records_from_json(self, payload: Any) -> list[dict[str, Any]]:
         candidates: list[dict[str, Any]] = []
         stack: list[Any] = [payload]
         while stack:
@@ -822,8 +861,20 @@ class StockWarningBot(commands.Bot):
                         stack.append(item)
 
         if not candidates:
-            return None
-        return max(candidates, key=lambda item: int(item["period_key"]))
+            return []
+
+        candidates.sort(key=lambda item: int(item["period_key"]), reverse=True)
+        unique: list[dict[str, Any]] = []
+        seen_periods: set[int] = set()
+        for item in candidates:
+            period_key = int(item["period_key"])
+            if period_key in seen_periods:
+                continue
+            unique.append(item)
+            seen_periods.add(period_key)
+            if len(unique) >= 2:
+                break
+        return unique
 
     def _load_json_flexibly(self, text: str) -> Any:
         stripped = (text or "").strip()
@@ -873,9 +924,11 @@ class StockWarningBot(commands.Bot):
                         body = await resp.text(errors="ignore")
 
                     payload = self._load_json_flexibly(body)
-                    latest = self._select_latest_economy_record_from_json(payload)
-                    if not latest:
+                    records = self._select_latest_economy_records_from_json(payload)
+                    if not records:
                         raise RuntimeError("JSON 內找不到可用的景氣分數與月份")
+                    latest = records[0]
+                    previous = records[1] if len(records) > 1 else None
 
                     signal_text = latest.get("signal_text") or latest.get("color_name")
                     return {
@@ -886,6 +939,10 @@ class StockWarningBot(commands.Bot):
                         "signal_text": signal_text,
                         "color_name": latest["color_name"],
                         "score_range": latest["score_range"],
+                        "previous_display": previous["display"] if previous else None,
+                        "previous_score": previous["score"] if previous else None,
+                        "previous_color_name": previous["color_name"] if previous else None,
+                        "previous_score_range": previous["score_range"] if previous else None,
                         "source_api_url": source_api_url,
                         "source_page_url": self.settings.economy_page_url,
                         "official_page_url": self.settings.economy_page_url,
@@ -969,9 +1026,7 @@ class StockWarningBot(commands.Bot):
             csv_text = archive.read(csv_name).decode("utf-8-sig", errors="ignore")
 
         reader = csv.DictReader(io.StringIO(csv_text))
-        latest_row: dict[str, str] | None = None
-        latest_period: tuple[int, str, str] | None = None
-        latest_date_value = -1
+        parsed_rows: list[dict[str, Any]] = []
         for row in reader:
             if not isinstance(row, dict):
                 continue
@@ -980,35 +1035,54 @@ class StockWarningBot(commands.Bot):
                 period = parse_year_month(row.get("年月"))
             if period is None:
                 continue
-            date_value = period[0]
-            if date_value > latest_date_value:
-                latest_date_value = date_value
-                latest_row = row
-                latest_period = period
+            score = parse_int_str(row.get("景氣對策信號綜合分數"))
+            if score is None:
+                continue
+            color_name, score_range = economy_color_range(score)
+            parsed_rows.append(
+                {
+                    "period_key": period[0],
+                    "display": period[1],
+                    "raw_id": period[2],
+                    "score": score,
+                    "signal_text": normalize_signal_color_text(
+                        _optional_str(row.get("景氣對策信號"))
+                    ),
+                    "color_name": color_name,
+                    "score_range": score_range,
+                }
+            )
 
-        if not latest_row or not latest_period:
+        if not parsed_rows:
             raise RuntimeError("無法從 CSV 解析最新景氣資料")
 
-        display = latest_period[1]
-        date_raw = latest_period[2]
+        parsed_rows.sort(key=lambda item: int(item["period_key"]), reverse=True)
+        unique_rows: list[dict[str, Any]] = []
+        seen_periods: set[int] = set()
+        for item in parsed_rows:
+            period_key = int(item["period_key"])
+            if period_key in seen_periods:
+                continue
+            unique_rows.append(item)
+            seen_periods.add(period_key)
+            if len(unique_rows) >= 2:
+                break
 
-        score = parse_int_str(latest_row.get("景氣對策信號綜合分數"))
-        if score is None:
-            raise RuntimeError("無法解析景氣對策信號綜合分數")
-
-        signal_text = normalize_signal_color_text(
-            _optional_str(latest_row.get("景氣對策信號"))
-        )
-        color_name, score_range = economy_color_range(score)
+        latest = unique_rows[0]
+        previous = unique_rows[1] if len(unique_rows) > 1 else None
 
         return {
-            "release_id": f"period:{date_raw}:score:{score}",
-            "display": display,
-            "date_raw": date_raw,
-            "score": score,
-            "signal_text": signal_text,
-            "color_name": color_name,
-            "score_range": score_range,
+            "release_id": f"period:{latest['raw_id']}:score:{latest['score']}",
+            "display": latest["display"],
+            "date_raw": latest["raw_id"],
+            "score": latest["score"],
+            "signal_text": latest["signal_text"],
+            "color_name": latest["color_name"],
+            "score_range": latest["score_range"],
+            "previous_display": previous["display"] if previous else None,
+            "previous_score": previous["score"] if previous else None,
+            "previous_color_name": previous["color_name"] if previous else None,
+            "previous_score_range": previous["score_range"] if previous else None,
             "source_zip_url": zip_url,
             "source_api_url": None,
             "source_page_url": DATA_GOV_DATASET_URL,
@@ -1016,15 +1090,15 @@ class StockWarningBot(commands.Bot):
         }
 
     async def check_economy_for_user(
-        self, user_id: int, user_payload: dict[str, Any]
-    ) -> None:
+        self, user_id: int, user_payload: dict[str, Any], force_notify: bool = False
+    ) -> bool:
         release_data = await self.get_latest_economy_release()
         if not release_data:
-            return
+            return False
 
         latest_id = release_data.get("release_id")
         if not latest_id:
-            return
+            return False
 
         should_notify = False
 
@@ -1034,13 +1108,16 @@ class StockWarningBot(commands.Bot):
             previous = economy_state.get("last_release_id")
             if previous is None:
                 economy_state["last_release_id"] = latest_id
+                should_notify = force_notify
             elif previous != latest_id:
                 economy_state["last_release_id"] = latest_id
+                should_notify = True
+            elif force_notify:
                 should_notify = True
 
         await self.store.update_user(user_id, mutator)
         if not should_notify:
-            return
+            return True
 
         lines = [
             "[景氣對策信號更新通知]",
@@ -1048,8 +1125,17 @@ class StockWarningBot(commands.Bot):
             f"景氣對策信號綜合分數: {release_data.get('score')} 分",
             f"燈號區間: {release_data.get('score_range')}（{release_data.get('color_name')}）",
         ]
-        if release_data.get("signal_text"):
-            lines.append(f"官方燈號文字: {release_data['signal_text']}")
+        if release_data.get("previous_score") is not None:
+            lines.append(
+                f"前一期分數: {release_data.get('previous_display')} "
+                f"{release_data.get('previous_score')} 分"
+            )
+            if release_data.get("previous_score_range") and release_data.get(
+                "previous_color_name"
+            ):
+                lines.append(
+                    f"前一期燈號區間: {release_data.get('previous_score_range')}（{release_data.get('previous_color_name')}）"
+                )
         if release_data.get("official_page_url"):
             lines.append(f"官方頁面: {release_data.get('official_page_url')}")
         if release_data.get("source_api_url"):
@@ -1063,6 +1149,8 @@ class StockWarningBot(commands.Bot):
             await self.send_alert_to_user(user_id, "\n".join(lines))
         except Exception:
             logging.exception("傳送使用者 %s 景氣通知失敗", user_id)
+            raise
+        return True
 
 
 async def ensure_dm_interaction(interaction: discord.Interaction) -> bool:
@@ -1159,8 +1247,17 @@ def build_bot(settings: Settings) -> StockWarningBot:
             f"- 燈號: {release_data.get('score')} 分，"
             f"{release_data.get('score_range')}（{release_data.get('color_name')}）"
         )
-        if release_data.get("signal_text"):
-            lines.append(f"- 官方燈號文字: {release_data.get('signal_text')}")
+        if release_data.get("previous_score") is not None:
+            lines.append(
+                f"- 前一期: {release_data.get('previous_display')} "
+                f"{release_data.get('previous_score')} 分"
+            )
+            if release_data.get("previous_score_range") and release_data.get(
+                "previous_color_name"
+            ):
+                lines.append(
+                    f"- 前一期區間: {release_data.get('previous_score_range')}（{release_data.get('previous_color_name')}）"
+                )
         return "\n".join(lines)
 
     @bot.tree.command(name="status", description="查看你的監控狀態（私訊模式）")
@@ -1172,7 +1269,7 @@ def build_bot(settings: Settings) -> StockWarningBot:
             "你的 StockWarning 狀態:",
             f"- 追蹤股票數: {len(user['watchlist'])}",
             f"- 股票輪詢秒數(全域): {settings.default_stock_interval_sec}",
-            f"- 景氣輪詢秒數(全域): {settings.default_economy_interval_sec}",
+            "- 景氣排程(全域): 每月 27 日 20:00（遇週末順延至週一）",
         ]
         await interaction.response.send_message("\n".join(lines))
 
