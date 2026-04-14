@@ -12,6 +12,7 @@ from urllib.parse import urljoin
 
 import aiohttp
 import discord
+from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
@@ -59,6 +60,7 @@ class Settings:
     state_path: Path
     economy_url: str
     guild_id: int | None
+    manual_check_timeout_sec: int
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -80,6 +82,7 @@ class Settings:
 
         stock_interval = int(os.getenv("STOCK_CHECK_INTERVAL_SEC", "300"))
         economy_interval = int(os.getenv("ECONOMY_CHECK_INTERVAL_SEC", "21600"))
+        manual_timeout = int(os.getenv("MANUAL_CHECK_TIMEOUT_SEC", "45"))
 
         watchlist = Path(os.getenv("WATCHLIST_PATH", "watchlist.json")).resolve()
         state = Path(os.getenv("STATE_PATH", "state.json")).resolve()
@@ -94,6 +97,7 @@ class Settings:
             state_path=state,
             economy_url=economy_url or NDC_ECONOMY_PAGE_URL,
             guild_id=guild_id,
+            manual_check_timeout_sec=max(10, manual_timeout),
         )
 
 
@@ -427,6 +431,19 @@ class StockWarningBot(commands.Bot):
 def build_bot(settings: Settings) -> StockWarningBot:
     bot = StockWarningBot(settings)
 
+    async def run_manual_check(label: str, callback) -> str:
+        try:
+            await asyncio.wait_for(
+                callback(), timeout=settings.manual_check_timeout_sec
+            )
+            return f"- {label}: 完成"
+        except asyncio.TimeoutError:
+            logging.warning("手動檢查逾時: %s", label)
+            return f"- {label}: 逾時（>{settings.manual_check_timeout_sec} 秒）"
+        except Exception as exc:
+            logging.exception("手動檢查失敗: %s", label)
+            return f"- {label}: 失敗（{type(exc).__name__}: {exc}）"
+
     @bot.tree.command(name="status", description="查看機器人監控狀態")
     async def status(interaction: discord.Interaction) -> None:
         rules = load_watchlist(settings.watchlist_path)
@@ -446,9 +463,28 @@ def build_bot(settings: Settings) -> StockWarningBot:
     @bot.tree.command(name="check_now", description="立即檢查一次股票與景氣燈號")
     async def check_now(interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
-        await bot.check_stocks()
-        await bot.check_economy_release()
-        await interaction.followup.send("已完成一次手動檢查。", ephemeral=True)
+        results = await asyncio.gather(
+            run_manual_check("股票檢查", bot.check_stocks),
+            run_manual_check("景氣燈號檢查", bot.check_economy_release),
+        )
+        await interaction.followup.send(
+            "\n".join(["已完成一次手動檢查。", *results]),
+            ephemeral=True,
+        )
+
+    @bot.tree.error
+    async def on_app_command_error(
+        interaction: discord.Interaction, error: app_commands.AppCommandError
+    ) -> None:
+        logging.exception("Slash 指令失敗", exc_info=error)
+        message = f"指令執行失敗：{type(error).__name__}"
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        except Exception:
+            logging.exception("無法回覆 slash 指令錯誤訊息")
 
     return bot
 

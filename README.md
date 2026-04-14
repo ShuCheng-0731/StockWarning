@@ -32,6 +32,7 @@ pip install -r requirements.txt
 3. （可選）調整輪詢秒數：
    - `STOCK_CHECK_INTERVAL_SEC`
    - `ECONOMY_CHECK_INTERVAL_SEC`
+   - `MANUAL_CHECK_TIMEOUT_SEC`（`/check_now` 單項檢查逾時秒數）
 4. 建立 `watchlist.json`（可先複製 `watchlist.example.json`）
 
 `watchlist.json` 欄位說明：
