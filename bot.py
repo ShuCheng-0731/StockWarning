@@ -10,7 +10,7 @@ import ssl
 import time
 import zipfile
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from html import unescape
 from pathlib import Path
 from time import monotonic
@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 
 
 TWSE_QUOTE_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
+TWSE_STOCK_DAY_URL = "https://www.twse.com.tw/exchangeReport/STOCK_DAY"
 DATA_GOV_DATASET_URL = "https://data.gov.tw/dataset/6099"
 NDC_ECONOMY_PAGE_URL = "https://index.ndc.gov.tw/n/zh_tw"
 NDC_ECONOMY_JSON_URL = "https://index.ndc.gov.tw/n/json/lightscore"
@@ -48,6 +49,7 @@ DEFAULT_WATCHLIST: list[dict[str, Any]] = [
         "down_pct": 3.0,
         "target_high": None,
         "target_low": None,
+        "drawdown_3m_pct": None,
     },
     {
         "symbol": "0050",
@@ -56,6 +58,7 @@ DEFAULT_WATCHLIST: list[dict[str, Any]] = [
         "down_pct": 2.0,
         "target_high": None,
         "target_low": None,
+        "drawdown_3m_pct": None,
     },
 ]
 
@@ -108,6 +111,7 @@ class StockRule:
     down_pct: float | None
     target_high: float | None
     target_low: float | None
+    drawdown_3m_pct: float | None
 
     @classmethod
     def from_dict(cls, row: dict[str, Any]) -> "StockRule":
@@ -121,6 +125,7 @@ class StockRule:
             down_pct=_optional_float(row.get("down_pct")),
             target_high=_optional_float(row.get("target_high")),
             target_low=_optional_float(row.get("target_low")),
+            drawdown_3m_pct=_optional_float(row.get("drawdown_3m_pct")),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -131,6 +136,7 @@ class StockRule:
             "down_pct": self.down_pct,
             "target_high": self.target_high,
             "target_low": self.target_low,
+            "drawdown_3m_pct": self.drawdown_3m_pct,
         }
 
 
@@ -225,6 +231,36 @@ def parse_year_month(value: Any) -> tuple[int, str, str] | None:
         raw_id = f"{year:04d}{month:02d}"
         return (year * 100 + month, f"{year:04d}-{month:02d}", raw_id)
     return None
+
+
+def parse_tw_calendar_date(value: Any) -> date | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    parts = re.split(r"[/-]", text)
+    if len(parts) < 3:
+        return None
+    try:
+        year = int(parts[0])
+        month = int(parts[1])
+        day = int(parts[2])
+    except ValueError:
+        return None
+    if year < 1911:
+        year += 1911
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
+def month_start_yyyymm01(base: datetime, month_offset: int) -> str:
+    year = base.year
+    month = base.month - month_offset
+    while month <= 0:
+        month += 12
+        year -= 1
+    return f"{year:04d}{month:02d}01"
 
 
 def economy_schedule_datetime(year: int, month: int) -> datetime:
@@ -339,6 +375,7 @@ class UserDataStore:
                     "down_pct": _optional_float(row.get("down_pct")),
                     "target_high": _optional_float(row.get("target_high")),
                     "target_low": _optional_float(row.get("target_low")),
+                    "drawdown_3m_pct": _optional_float(row.get("drawdown_3m_pct")),
                 }
             )
         if not normalized_watchlist:
@@ -482,6 +519,8 @@ def format_stock_rule_line(index: int, rule: StockRule) -> str:
         conditions.append(f"高於{rule.target_high:.2f}")
     if rule.target_low is not None:
         conditions.append(f"低於{rule.target_low:.2f}")
+    if rule.drawdown_3m_pct is not None:
+        conditions.append(f"近3月高點回落>={rule.drawdown_3m_pct:.2f}%")
     condition_text = "、".join(conditions) if conditions else "未設定條件"
     return f"{index}. {rule.symbol} ({name}) | {condition_text}"
 
@@ -508,6 +547,7 @@ class StockWarningBot(commands.Bot):
         self.session: aiohttp.ClientSession | None = None
         self.background_tasks: list[asyncio.Task[Any]] = []
         self._economy_cache: dict[str, Any] = {"ts": 0.0, "data": None}
+        self._three_month_high_cache: dict[str, dict[str, Any]] = {}
 
     async def setup_hook(self) -> None:
         self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
@@ -555,6 +595,7 @@ class StockWarningBot(commands.Bot):
         due_schedule_key, due_schedule_time = latest_due_economy_schedule(now_local)
         check_plan: list[dict[str, Any]] = []
         all_due_stock_symbols: set[str] = set()
+        all_due_drawdown_symbols: set[str] = set()
 
         for user_id in user_ids:
             user = await self.store.get_user(user_id)
@@ -572,6 +613,11 @@ class StockWarningBot(commands.Bot):
             if due_stock:
                 stock_rules = parse_stock_rules(user.get("watchlist", []))
                 all_due_stock_symbols.update(rule.symbol for rule in stock_rules)
+                all_due_drawdown_symbols.update(
+                    rule.symbol
+                    for rule in stock_rules
+                    if rule.drawdown_3m_pct is not None
+                )
 
             check_plan.append(
                 {
@@ -584,6 +630,7 @@ class StockWarningBot(commands.Bot):
             )
 
         shared_quotes: dict[str, dict[str, Any]] | None = None
+        shared_three_month_highs: dict[str, float] | None = None
         skip_individual_stock_fetch = False
         if all_due_stock_symbols and self.session:
             try:
@@ -595,6 +642,14 @@ class StockWarningBot(commands.Bot):
                 # 批次失敗時避免每位使用者各自重試，降低網路與 CPU 消耗。
                 shared_quotes = {}
                 skip_individual_stock_fetch = True
+            if all_due_drawdown_symbols:
+                try:
+                    shared_three_month_highs = await self.get_three_month_high_map(
+                        sorted(all_due_drawdown_symbols)
+                    )
+                except Exception:
+                    logging.exception("批次三個月高點抓取失敗")
+                    shared_three_month_highs = {}
 
         for item in check_plan:
             user_id = int(item["user_id"])
@@ -613,6 +668,7 @@ class StockWarningBot(commands.Bot):
                         user,
                         preloaded_rules=stock_rules,
                         preloaded_quotes=shared_quotes,
+                        preloaded_three_month_highs=shared_three_month_highs,
                         skip_fetch=skip_individual_stock_fetch,
                     )
                     stock_ok = True
@@ -653,12 +709,98 @@ class StockWarningBot(commands.Bot):
             target_user = await self.fetch_user(user_id)
         await target_user.send(message)
 
+    async def _fetch_symbol_three_month_high(self, symbol: str) -> float | None:
+        if not self.session:
+            return None
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 StockWarningBot/1.0",
+            "Accept": "application/json,text/plain,*/*",
+            "Referer": "https://www.twse.com.tw/",
+        }
+        now_local = datetime.now(TAIPEI_TZ)
+        cutoff = (now_local - timedelta(days=90)).date()
+        highs: list[float] = []
+
+        for month_offset in range(4):
+            date_arg = month_start_yyyymm01(now_local, month_offset)
+            params = {"response": "json", "date": date_arg, "stockNo": symbol}
+            try:
+                async with self.session.get(
+                    TWSE_STOCK_DAY_URL, params=params, headers=headers
+                ) as resp:
+                    if resp.status >= 400:
+                        continue
+                    payload = await resp.json(content_type=None)
+            except Exception:
+                continue
+
+            if str(payload.get("stat", "")).strip().upper() != "OK":
+                continue
+            rows = payload.get("data", [])
+            if not isinstance(rows, list):
+                continue
+
+            for row in rows:
+                if not isinstance(row, list) or len(row) < 5:
+                    continue
+                trading_day = parse_tw_calendar_date(row[0])
+                if not trading_day or trading_day < cutoff:
+                    continue
+                high = parse_float_str(str(row[4]).replace(",", ""))
+                if high is not None and high > 0:
+                    highs.append(high)
+
+        if not highs:
+            return None
+        return max(highs)
+
+    async def get_three_month_high_map(self, symbols: list[str]) -> dict[str, float]:
+        unique_symbols = sorted({s for s in symbols if is_tw_stock_symbol(s)})
+        if not unique_symbols:
+            return {}
+
+        now_ts = time.time()
+        result: dict[str, float] = {}
+        fetch_targets: list[str] = []
+
+        for symbol in unique_symbols:
+            cached = self._three_month_high_cache.get(symbol)
+            if cached:
+                cached_ts = float(cached.get("ts", 0.0) or 0.0)
+                cached_high = cached.get("high")
+                ttl = 21600 if cached_high is not None else 3600
+                if now_ts - cached_ts < ttl:
+                    if isinstance(cached_high, (float, int)):
+                        result[symbol] = float(cached_high)
+                    continue
+            fetch_targets.append(symbol)
+
+        if not fetch_targets:
+            return result
+
+        semaphore = asyncio.Semaphore(4)
+
+        async def worker(symbol: str) -> tuple[str, float | None]:
+            async with semaphore:
+                value = await self._fetch_symbol_three_month_high(symbol)
+                return (symbol, value)
+
+        pairs = await asyncio.gather(*(worker(symbol) for symbol in fetch_targets))
+        for symbol, high in pairs:
+            self._three_month_high_cache[symbol] = {"ts": now_ts, "high": high}
+            if high is not None:
+                result[symbol] = high
+
+        return result
+
     async def check_stocks_for_user(
         self,
         user_id: int,
         user_payload: dict[str, Any],
         preloaded_rules: list[StockRule] | None = None,
         preloaded_quotes: dict[str, dict[str, Any]] | None = None,
+        preloaded_three_month_highs: dict[str, float] | None = None,
         skip_fetch: bool = False,
     ) -> None:
         if not self.session:
@@ -677,6 +819,12 @@ class StockWarningBot(commands.Bot):
                 return
             symbols = sorted({rule.symbol for rule in rules})
             quotes = await fetch_twse_quotes(self.session, symbols)
+
+        if preloaded_three_month_highs is not None:
+            three_month_highs = preloaded_three_month_highs
+        else:
+            symbols = sorted({rule.symbol for rule in rules if rule.drawdown_3m_pct is not None})
+            three_month_highs = await self.get_three_month_high_map(symbols)
         pending_alerts: list[str] = []
 
         def mutator(payload: dict[str, Any]) -> None:
@@ -723,6 +871,20 @@ class StockWarningBot(commands.Bot):
                             f"價格 <= {rule.target_low:.2f}",
                         )
                     )
+                if rule.drawdown_3m_pct is not None:
+                    high_3m = three_month_highs.get(rule.symbol)
+                    if high_3m and high_3m > 0:
+                        drawdown_pct = ((high_3m - price) / high_3m) * 100
+                        checks.append(
+                            (
+                                "drawdown_3m",
+                                drawdown_pct >= rule.drawdown_3m_pct,
+                                (
+                                    f"近3月高點回落 >= {rule.drawdown_3m_pct:.2f}% "
+                                    f"(高點 {high_3m:.2f}，現價 {price:.2f}，回落 {drawdown_pct:.2f}%)"
+                                ),
+                            )
+                        )
 
                 for check_name, is_hit, condition_text in checks:
                     state_key = f"{rule.symbol}|{check_name}"
@@ -1174,12 +1336,21 @@ def build_bot(settings: Settings) -> StockWarningBot:
 
         lines: list[str] = ["追蹤清單與股價:"]
         quote_map: dict[str, dict[str, Any]] = {}
+        three_month_highs: dict[str, float] = {}
         if bot.session and rules:
             symbols = sorted({rule.symbol for rule in rules})
             try:
                 quote_map = await fetch_twse_quotes(bot.session, symbols)
             except Exception as exc:
                 lines.append(f"- 股價資料取得失敗: {type(exc).__name__}")
+            dd_symbols = sorted(
+                {rule.symbol for rule in rules if rule.drawdown_3m_pct is not None}
+            )
+            if dd_symbols:
+                try:
+                    three_month_highs = await bot.get_three_month_high_map(dd_symbols)
+                except Exception as exc:
+                    lines.append(f"- 三個月高點資料取得失敗: {type(exc).__name__}")
 
         if not rules:
             lines.append("- 目前沒有追蹤股票")
@@ -1196,12 +1367,30 @@ def build_bot(settings: Settings) -> StockWarningBot:
                     lines.append(f"- {rule.symbol} ({display_name}): 無法取得報價")
                     continue
                 if prev_close in (None, 0):
-                    lines.append(f"- {rule.symbol} ({display_name}): {price:.2f}")
+                    detail = f"- {rule.symbol} ({display_name}): {price:.2f}"
+                    if rule.drawdown_3m_pct is not None:
+                        high_3m = three_month_highs.get(rule.symbol)
+                        if high_3m and high_3m > 0:
+                            dd = ((high_3m - price) / high_3m) * 100
+                            detail += (
+                                f" | 近3月回落 {dd:.2f}% "
+                                f"(門檻 {rule.drawdown_3m_pct:.2f}%)"
+                            )
+                    lines.append(detail)
                     continue
                 change_pct = ((price - prev_close) / prev_close) * 100
-                lines.append(
+                detail = (
                     f"- {rule.symbol} ({display_name}): {price:.2f} ({change_pct:+.2f}%)"
                 )
+                if rule.drawdown_3m_pct is not None:
+                    high_3m = three_month_highs.get(rule.symbol)
+                    if high_3m and high_3m > 0:
+                        dd = ((high_3m - price) / high_3m) * 100
+                        detail += (
+                            f" | 近3月回落 {dd:.2f}% "
+                            f"(門檻 {rule.drawdown_3m_pct:.2f}%)"
+                        )
+                lines.append(detail)
 
         release_data = await bot.get_latest_economy_release()
         lines.append("")
@@ -1256,6 +1445,7 @@ def build_bot(settings: Settings) -> StockWarningBot:
         down_pct: float | None = None,
         target_high: float | None = None,
         target_low: float | None = None,
+        drawdown_3m_pct: float | None = None,
     ) -> None:
         if not await ensure_dm_interaction(interaction):
             return
@@ -1273,6 +1463,9 @@ def build_bot(settings: Settings) -> StockWarningBot:
             return
         if down_pct is not None and down_pct < 0:
             await interaction.response.send_message("`down_pct` 請填正數或 0。")
+            return
+        if drawdown_3m_pct is not None and drawdown_3m_pct < 0:
+            await interaction.response.send_message("`drawdown_3m_pct` 請填正數或 0。")
             return
         if (
             target_high is not None
@@ -1298,6 +1491,7 @@ def build_bot(settings: Settings) -> StockWarningBot:
                     down_pct=down_pct,
                     target_high=target_high,
                     target_low=target_low,
+                    drawdown_3m_pct=drawdown_3m_pct,
                 ).to_dict()
             )
 
@@ -1320,10 +1514,12 @@ def build_bot(settings: Settings) -> StockWarningBot:
         down_pct: float | None = None,
         target_high: float | None = None,
         target_low: float | None = None,
+        drawdown_3m_pct: float | None = None,
         clear_up_pct: bool = False,
         clear_down_pct: bool = False,
         clear_target_high: bool = False,
         clear_target_low: bool = False,
+        clear_drawdown_3m_pct: bool = False,
     ) -> None:
         if not await ensure_dm_interaction(interaction):
             return
@@ -1341,6 +1537,9 @@ def build_bot(settings: Settings) -> StockWarningBot:
             return
         if down_pct is not None and down_pct < 0:
             await interaction.response.send_message("`down_pct` 請填正數或 0。")
+            return
+        if drawdown_3m_pct is not None and drawdown_3m_pct < 0:
+            await interaction.response.send_message("`drawdown_3m_pct` 請填正數或 0。")
             return
 
         payload = await bot.store.get_user(interaction.user.id)
@@ -1366,6 +1565,8 @@ def build_bot(settings: Settings) -> StockWarningBot:
             target_row["target_high"] = None
         if clear_target_low:
             target_row["target_low"] = None
+        if clear_drawdown_3m_pct:
+            target_row["drawdown_3m_pct"] = None
         if up_pct is not None:
             target_row["up_pct"] = up_pct
         if down_pct is not None:
@@ -1374,6 +1575,8 @@ def build_bot(settings: Settings) -> StockWarningBot:
             target_row["target_high"] = target_high
         if target_low is not None:
             target_row["target_low"] = target_low
+        if drawdown_3m_pct is not None:
+            target_row["drawdown_3m_pct"] = drawdown_3m_pct
 
         high = _optional_float(target_row.get("target_high"))
         low = _optional_float(target_row.get("target_low"))

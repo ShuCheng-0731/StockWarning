@@ -11,6 +11,10 @@
 - `/watchlist_remove`：移除追蹤股票
 - `/check_now`：立即手動檢查，顯示追蹤清單、股價、景氣燈號（最新與前一期分數、顏色區間）
 
+補充：
+
+- 可在 `/watchlist_add` 或 `/watchlist_update` 設定 `drawdown_3m_pct`，觸發「近 3 個月高點回落超過 X%」通知。
+
 建議低占用設定（Railway）：
 
 - `POLL_TICK_SEC=60`
