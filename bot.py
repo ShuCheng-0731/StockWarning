@@ -263,6 +263,14 @@ def month_start_yyyymm01(base: datetime, month_offset: int) -> str:
     return f"{year:04d}{month:02d}01"
 
 
+def is_stock_polling_time(now: datetime) -> bool:
+    # 僅在台北時間週一到週五 09:00~13:30 進行自動股票輪詢。
+    if now.weekday() >= 5:
+        return False
+    minutes = now.hour * 60 + now.minute
+    return (9 * 60) <= minutes <= (13 * 60 + 30)
+
+
 def economy_schedule_datetime(year: int, month: int) -> datetime:
     dt = datetime(year, month, 27, 20, 0, 0, tzinfo=TAIPEI_TZ)
     while dt.weekday() >= 5:
@@ -592,6 +600,7 @@ class StockWarningBot(commands.Bot):
             return
         now_ts = time.time()
         now_local = datetime.now(TAIPEI_TZ)
+        stock_window_open = is_stock_polling_time(now_local)
         due_schedule_key, due_schedule_time = latest_due_economy_schedule(now_local)
         check_plan: list[dict[str, Any]] = []
         all_due_stock_symbols: set[str] = set()
@@ -600,8 +609,9 @@ class StockWarningBot(commands.Bot):
         for user_id in user_ids:
             user = await self.store.get_user(user_id)
             state = user["state"]
-            due_stock = now_ts - float(state.get("last_stock_check_ts", 0.0)) >= float(
-                self.settings.default_stock_interval_sec
+            due_stock = stock_window_open and (
+                now_ts - float(state.get("last_stock_check_ts", 0.0))
+                >= float(self.settings.default_stock_interval_sec)
             )
             due_economy = (
                 now_local >= due_schedule_time

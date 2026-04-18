@@ -20,6 +20,10 @@
 - `POLL_TICK_SEC=60`
 - `STOCK_CHECK_INTERVAL_SEC=600`
 
+股票自動輪詢時段（固定）：
+
+- 週一到週五 09:00~13:30（Asia/Taipei）
+
 景氣通知排程（固定）：
 
 - 每月 27 日 20:00（Asia/Taipei）
