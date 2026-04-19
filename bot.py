@@ -549,11 +549,13 @@ def parse_stock_rules(rows: Any) -> list[StockRule]:
 
 class StockWarningBot(commands.Bot):
     def __init__(self, settings: Settings):
+        now_local = datetime.now(TAIPEI_TZ)
+        is_weekend = now_local.weekday() >= 5
         super().__init__(
             command_prefix="!",
             intents=discord.Intents.default(),
-            status=discord.Status.online,
-            activity=discord.Game(name="台股監控中"),
+            status=discord.Status.idle if is_weekend else discord.Status.online,
+            activity=discord.Game(name="休息中" if is_weekend else "台股監控中"),
         )
         self.settings = settings
         self.store = UserDataStore(settings)
@@ -591,10 +593,14 @@ class StockWarningBot(commands.Bot):
         logging.info("Gateway 連線恢復：%s", self.user)
 
     async def _set_online_presence(self) -> None:
+        now_local = datetime.now(TAIPEI_TZ)
+        is_weekend = now_local.weekday() >= 5
+        desired_status = discord.Status.idle if is_weekend else discord.Status.online
+        desired_text = "休息中" if is_weekend else "台股監控中"
         try:
             await self.change_presence(
-                status=discord.Status.online,
-                activity=discord.Game(name="台股監控中"),
+                status=desired_status,
+                activity=discord.Game(name=desired_text),
             )
         except Exception:
             logging.exception("設定上線狀態失敗")
