@@ -577,6 +577,10 @@ class StockWarningBot(commands.Bot):
         await super().close()
 
     async def on_ready(self) -> None:
+        try:
+            await self.change_presence(status=discord.Status.online)
+        except Exception:
+            logging.exception("設定上線狀態失敗")
         logging.info("Bot 已上線：%s", self.user)
 
     async def sync_global_commands(self) -> int:
@@ -1652,7 +1656,7 @@ def build_bot(settings: Settings) -> StockWarningBot:
         await interaction.response.defer(thinking=True)
 
         user_payload = await bot.store.get_user(interaction.user.id)
-        results = await asyncio.gather(
+        await asyncio.gather(
             run_manual_check(
                 interaction.user.id,
                 "股票檢查",
@@ -1665,9 +1669,7 @@ def build_bot(settings: Settings) -> StockWarningBot:
             ),
         )
         snapshot = await build_check_now_snapshot(interaction.user.id)
-        await interaction.followup.send(
-            "\n".join(["已完成一次手動檢查。", *results, "", snapshot])
-        )
+        await interaction.followup.send(snapshot)
 
     @bot.tree.error
     async def on_app_command_error(
