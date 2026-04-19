@@ -549,7 +549,12 @@ def parse_stock_rules(rows: Any) -> list[StockRule]:
 
 class StockWarningBot(commands.Bot):
     def __init__(self, settings: Settings):
-        super().__init__(command_prefix="!", intents=discord.Intents.default())
+        super().__init__(
+            command_prefix="!",
+            intents=discord.Intents.default(),
+            status=discord.Status.online,
+            activity=discord.Game(name="台股監控中"),
+        )
         self.settings = settings
         self.store = UserDataStore(settings)
         self.session: aiohttp.ClientSession | None = None
