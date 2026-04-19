@@ -560,6 +560,7 @@ class StockWarningBot(commands.Bot):
     async def setup_hook(self) -> None:
         self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
         self.background_tasks.append(asyncio.create_task(self._run_scheduler_loop()))
+        self.background_tasks.append(asyncio.create_task(self._run_presence_keepalive()))
 
         try:
             synced = await self.sync_global_commands()
@@ -577,11 +578,27 @@ class StockWarningBot(commands.Bot):
         await super().close()
 
     async def on_ready(self) -> None:
+        await self._set_online_presence()
+        logging.info("Bot 已上線：%s", self.user)
+
+    async def on_resumed(self) -> None:
+        await self._set_online_presence()
+        logging.info("Gateway 連線恢復：%s", self.user)
+
+    async def _set_online_presence(self) -> None:
         try:
-            await self.change_presence(status=discord.Status.online)
+            await self.change_presence(
+                status=discord.Status.online,
+                activity=discord.Game(name="台股監控中"),
+            )
         except Exception:
             logging.exception("設定上線狀態失敗")
-        logging.info("Bot 已上線：%s", self.user)
+
+    async def _run_presence_keepalive(self) -> None:
+        await self.wait_until_ready()
+        while not self.is_closed():
+            await self._set_online_presence()
+            await asyncio.sleep(300)
 
     async def sync_global_commands(self) -> int:
         synced = await self.tree.sync()
